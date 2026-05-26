@@ -9,9 +9,41 @@
   let mode = 'normal'; // normal | insert | visual | visualLine
   let tempNormal = false; // from <C-O>
   let replaceMode = false; // insert-overwrite (R)
+  // Ops array recording user activity during insert / replace mode for '.' repeat.
+  // Each op is either { type: 'text', value: 'abc' } or { type: 'bs', count: N }.
+  // Backspaces collapse trailing text first; once the buffer is empty, additional
+  // backspaces accumulate as bs ops so we can faithfully replay over pre-existing text.
+  let insertOps = [];
+  function resetInsertOps() { insertOps = []; }
+  function appendOpText(s) {
+    if (!s) return;
+    const last = insertOps[insertOps.length - 1];
+    if (last && last.type === 'text') last.value += s;
+    else insertOps.push({ type: 'text', value: s });
+  }
+  function appendOpBs() {
+    const last = insertOps[insertOps.length - 1];
+    if (last && last.type === 'text' && last.value.length > 0) {
+      last.value = last.value.slice(0, -1);
+      if (!last.value) insertOps.pop();
+      return;
+    }
+    if (last && last.type === 'bs') last.count++;
+    else insertOps.push({ type: 'bs', count: 1 });
+  }
   let uiTheme = 'vim';
   let ui = null;
   let vimEnabled = true;
+
+  // Fire-and-forget exec: returns a Promise but does not block the next user key.
+  // Each command awaits its OWN Docs interactions internally via waitForDocsResponse,
+  // which provides correct intra-command timing without introducing cross-command
+  // mode-state lag (e.g., user typing fast after entering insert mode).
+  function runExec(result) {
+    let p;
+    try { p = executor.exec(result); } catch (e) { console.error('[VimExecutor] sync error', e); return; }
+    if (p && typeof p.catch === 'function') p.catch((err) => console.error('[VimExecutor] async error', err));
+  }
 
   function log(...args) { if (debug) console.log('[VimParser]', ...args); }
 
@@ -73,6 +105,8 @@
         if (mode === 'insert') {
           if (token === '<ESC>' || token === '<C-C>' || token === '<C-[>') {
             e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+            try { executor.finishInsert(insertOps); } catch (_) {}
+            resetInsertOps();
             setMode('normal'); replaceMode = false;
             return;
           }
@@ -82,12 +116,20 @@
             tempNormal = true; setMode('normal');
             return;
           }
-          // Replace mode: intercept printable characters and perform overwrite via executor
+          // Track printable characters typed in insert/replace mode for '.' repeat
+          if (e.key && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+            appendOpText(e.key);
+          } else if (token === '<CR>' && !replaceMode) {
+            appendOpText('\n');
+          } else if (token === '<BS>') {
+            appendOpBs();
+          }
+          // Replace mode: intercept printable characters and perform overwrite via executor.
+          // The insert_replace_char command no longer sets _lastChange itself; the session-level
+          // finishInsert(ops) records the full replace session at ESC time.
           if (replaceMode && e.key && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
             e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
-            try {
-              executor.exec({ kind: 'command', command: { id: 'insert_replace_char', args: { char: e.key }, modes: ['insert'] }, count: 1 });
-            } catch (_) {}
+            runExec({ kind: 'command', command: { id: 'insert_replace_char', args: { char: e.key }, modes: ['insert'] }, count: 1 });
             return;
           }
           return; // allow typing
@@ -98,7 +140,7 @@
 
         // ESC (or Ctrl+[) should be exit mode regardless of current mode
         if (token === '<ESC>' || token === '<C-[>') {
-          executor.exec({ kind: 'command', command: { id: 'exit_mode' }, count: 1 });
+          runExec({ kind: 'command', command: { id: 'exit_mode' }, count: 1 });
           return;
         }
 
@@ -109,13 +151,16 @@
 
         if (res.kind === 'prefix' || res.kind === 'await_char') { if (ui) ui.setBufferText((res.keys || []).join('')); log('prefix', res); return; }
 
-        // Completed parse -> execute
+        // Completed parse -> execute (async, fire-and-forget; intra-command waits handle timing)
         log('complete', res);
-        executor.exec(res);
+        runExec(res);
         if (ui) ui.setBufferText('');
 
         if (tempNormal) {
-          tempNormal = false; setMode('insert');
+          tempNormal = false;
+          const savedOps = insertOps; // preserve insert ops across tempNormal command
+          setMode('insert');
+          insertOps = savedOps;
         }
       } catch (err) {
         console.error('Parser error', err);
@@ -342,6 +387,7 @@
 
   // Simple mode manager used by executor
   function setMode(newMode) {
+    if (newMode === 'insert' && mode !== 'insert') resetInsertOps();
     mode = newMode;
     try { if (parser && typeof parser.setMode === 'function') parser.setMode(newMode); } catch (_) {}
     if (debug) console.log('[VimMode] ->', mode, tempNormal ? '(temp)' : '');
@@ -351,7 +397,8 @@
     setMode: (m) => { setMode(m); },
     getMode: () => mode,
     isVisual: () => mode === 'visual' || mode === 'visualLine',
-    getReplaceMode: () => replaceMode
+    getReplaceMode: () => replaceMode,
+    setReplaceMode: (v) => { replaceMode = !!v; }
   };
   const settingsAPI = {
     getUseDisplayLines: () => useDisplayLines

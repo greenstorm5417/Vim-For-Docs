@@ -1138,6 +1138,74 @@
 
   function repeat(n, fn) { for (let i = 0; i < (n || 1); i++) fn(i); }
 
+  // ---------- Async primitives for awaiting Google Docs reactions ----------
+  // sleep(ms): fallback delay used only where we genuinely cannot observe an event.
+  function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+  // waitForDocsResponse: resolves when Google Docs reacts to a synthetic
+  // keystroke / menu click, by listening for the next selectionchange event in
+  // the editor iframe OR the next DOM mutation in the editor surface, whichever
+  // comes first. Falls back to a timeout so callers never hang.
+  //   timeoutMs: maximum time to wait (ms). Default 60ms covers most arrow/text ops.
+  //   observeMutations: whether to also resolve on DOM mutations (default true).
+  function waitForDocsResponse(opts = {}) {
+    const timeoutMs = (typeof opts.timeoutMs === 'number') ? opts.timeoutMs : 60;
+    const observeMutations = opts.observeMutations !== false;
+    return new Promise((resolve) => {
+      let done = false;
+      let timer = null;
+      let mo = null;
+      let selDoc = null;
+      const finish = () => {
+        if (done) return; done = true;
+        try { if (selDoc) selDoc.removeEventListener('selectionchange', finish); } catch (_) {}
+        try { if (mo) mo.disconnect(); } catch (_) {}
+        try { if (timer) clearTimeout(timer); } catch (_) {}
+        resolve();
+      };
+      try {
+        const iframe = document.querySelector('.docs-texteventtarget-iframe');
+        const idoc = iframe && iframe.contentDocument;
+        if (idoc) {
+          selDoc = idoc;
+          idoc.addEventListener('selectionchange', finish, { once: true });
+          if (observeMutations) {
+            const target = idoc.querySelector('[contenteditable="true"]') || idoc.body;
+            if (target) {
+              mo = new MutationObserver(finish);
+              mo.observe(target, { childList: true, subtree: true, characterData: true });
+            }
+          }
+        }
+        // Also observe the visible Docs surface for content mutations (Docs renders
+        // text into the main document, not the input iframe).
+        if (observeMutations) {
+          const editorSurface = document.querySelector('.kix-appview-editor-container')
+            || document.querySelector('.kix-appview-editor')
+            || document.body;
+          if (editorSurface) {
+            const mo2 = new MutationObserver(finish);
+            mo2.observe(editorSurface, { childList: true, subtree: true, characterData: true });
+            // Tie its lifetime to the main observer
+            const origFinish = finish;
+            // Wrap finish to also disconnect mo2 (idempotent via 'done' flag)
+            const realFinish = () => { try { mo2.disconnect(); } catch (_) {} origFinish(); };
+            // Reassign timer/listeners to use realFinish - but we already attached origFinish.
+            // Simpler: schedule a tick to ensure cleanup on resolve.
+            const cleanup = () => { try { mo2.disconnect(); } catch (_) {} };
+            // Patch resolve to clean up mo2:
+            const _resolve = resolve;
+            resolve = (v) => { cleanup(); _resolve(v); };
+          }
+        }
+      } catch (_) {}
+      timer = setTimeout(finish, timeoutMs);
+    });
+  }
+
+  // Convenience: longer wait for menu-driven actions (undo/redo via menu click).
+  function waitForDocsResponseLong() { return waitForDocsResponse({ timeoutMs: 200 }); }
+
   class MotionExecutor {
     constructor(modeAPI, settingsAPI) {
       this.modeAPI = modeAPI;
@@ -1148,6 +1216,7 @@
       this.registers = { '"': { text: '', type: 'char' } }; // in-memory registers with type
       this._lastSelType = 'char';
       this._lastChange = null; // for '.' repeat
+      this._pendingInsertCmd = null; // tracks entry command for insert repeat
       this.marks = {}; // map from char -> { index }
       this._prevPos = null; // previous jump position for ``
       this._jumpList = [];
@@ -1167,7 +1236,7 @@
       } catch (_) {}
     }
 
-    exec(result) {
+    async exec(result) {
       focusEditor();
       if (!result || !result.kind) return;
       switch (result.kind) {
@@ -1195,7 +1264,46 @@
     }
 
     setLastChange(change) { this._lastChange = change; }
-    replayLastChange(overrideCount) {
+    // startInsert records what triggered insert-mode entry so '.' can replay it.
+    //   opts: {
+    //     id: 'insert_before' | 'append_after' | ... | 'substitute_char' | 'change_operator_motion' | ...
+    //     count: entry count (e.g., 5 for "5i")
+    //     kind: 'insert' (default) | 'replace' | 'change'
+    //     // For 'change' kind, any of:
+    //     operator, motion, textobj, register
+    //   }
+    // Backwards-compatible: if first arg is a string, treat as legacy (id, count) signature.
+    startInsert(optsOrId, legacyCount) {
+      let opts;
+      if (typeof optsOrId === 'string') {
+        opts = { id: optsOrId, count: legacyCount || 1, kind: 'insert' };
+      } else {
+        opts = Object.assign({ kind: 'insert', count: 1 }, optsOrId || {});
+      }
+      this._pendingInsertCmd = opts;
+    }
+    // finishInsert: called on ESC. ops is an array of {type:'text',value} or {type:'bs',count}.
+    // For backwards compat, accepts a plain string and converts to a single text op.
+    finishInsert(ops) {
+      if (!this._pendingInsertCmd) return;
+      const entry = this._pendingInsertCmd;
+      this._pendingInsertCmd = null;
+      let opsArr;
+      if (Array.isArray(ops)) opsArr = ops;
+      else if (typeof ops === 'string' && ops.length > 0) opsArr = [{ type: 'text', value: ops }];
+      else opsArr = [];
+      this._lastChange = {
+        type: entry.kind || 'insert',
+        entryId: entry.id,
+        entryCount: entry.count || 1,
+        ops: opsArr,
+        operator: entry.operator,
+        motion: entry.motion,
+        textobj: entry.textobj,
+        register: entry.register
+      };
+    }
+    async replayLastChange(overrideCount) {
       const c = this._lastChange;
       if (!c) return false;
       const useCount = (overrideCount && overrideCount > 0) ? overrideCount : (c.count || 1);
@@ -1208,8 +1316,167 @@
           return this.execOperatorTextObj({ operator: c.operator, textobj: c.textobj, register: c.register });
         case 'command':
           return this.execCommand(c.id, { count: useCount, register: c.register, command: { id: c.id, args: c.args || {}, modes: ['normal'] } });
+        case 'insert': {
+          // Repeat the whole positioning + insertion sequence useCount times so that
+          // counts on '.' (e.g., '5.') multiply the effect, matching Vim semantics.
+          const savedChange = this._lastChange;
+          const savedPending = this._pendingInsertCmd;
+          for (let r = 0; r < useCount; r++) {
+            await this._replayInsertEntry(c.entryId, c.entryCount || 1);
+            await this._applyInsertOps(c.ops || []);
+          }
+          this._lastChange = savedChange;
+          this._pendingInsertCmd = savedPending;
+          this.modeAPI.setMode('normal');
+          return true;
+        }
+        case 'replace': {
+          // R-mode replay: overwrite chars under cursor according to ops. Repeat useCount times.
+          const savedChange = this._lastChange;
+          const savedPending = this._pendingInsertCmd;
+          for (let r = 0; r < useCount; r++) {
+            await this._applyReplaceOps(c.ops || []);
+          }
+          this._lastChange = savedChange;
+          this._pendingInsertCmd = savedPending;
+          this.modeAPI.setMode('normal');
+          return true;
+        }
+        case 'change': {
+          // Re-execute the original deletion phase, then re-insert recorded ops. Repeat useCount times.
+          const savedChange = this._lastChange;
+          const savedPending = this._pendingInsertCmd;
+          for (let r = 0; r < useCount; r++) {
+            await this._replayChangeDeletion(c);
+            await this._applyInsertOps(c.ops || []);
+          }
+          this._lastChange = savedChange;
+          this._pendingInsertCmd = savedPending;
+          this.modeAPI.setMode('normal');
+          return true;
+        }
         default:
           return false;
+      }
+    }
+
+    // Re-execute the cursor positioning that the original insert-entry command performed,
+    // without touching _lastChange / _pendingInsertCmd state.
+    async _replayInsertEntry(entryId, entryCount) {
+      const needsWait = (entryId === 'open_below' || entryId === 'open_above');
+      switch (entryId) {
+        case 'insert_before': break;
+        case 'insert_start_line': Adapter.home({}); break;
+        case 'append_after': Adapter.right({}); break;
+        case 'append_end_line': Adapter.end({}); break;
+        case 'open_below':
+          Adapter.end({});
+          repeat(entryCount || 1, () => sendKeyEvent('enter', {}));
+          break;
+        case 'open_above': {
+          const t = entryCount || 1;
+          for (let i = 0; i < t; i++) { Adapter.home({}); sendKeyEvent('enter', {}); Adapter.up({}); }
+          break;
+        }
+        case 'append_end_word': this.execMotion('word_end_fwd', 1, false); break;
+        default: break;
+      }
+      if (needsWait) await waitForDocsResponse();
+    }
+
+    // Apply ops in sequence: text inserts via insertReplacementText, bs sends backspace keystrokes.
+    async _applyInsertOps(ops) {
+      if (!Array.isArray(ops)) return;
+      for (const op of ops) {
+        if (op.type === 'text' && op.value) {
+          this.insertReplacementText(op.value);
+          await waitForDocsResponse();
+        } else if (op.type === 'bs' && op.count > 0) {
+          for (let i = 0; i < op.count; i++) Adapter.backspace({});
+          await waitForDocsResponse();
+        }
+      }
+    }
+
+    // R-mode replay: each text char overwrites the char under cursor (extend right + replace),
+    // each bs moves cursor left without deleting (vim R-mode BS semantics, simplified).
+    async _applyReplaceOps(ops) {
+      if (!Array.isArray(ops)) return;
+      for (const op of ops) {
+        if (op.type === 'text' && op.value) {
+          for (const ch of op.value) {
+            Adapter.right({ shift: true });
+            await waitForDocsResponse();
+            this.insertReplacementText(ch);
+            await waitForDocsResponse();
+          }
+        } else if (op.type === 'bs' && op.count > 0) {
+          for (let i = 0; i < op.count; i++) {
+            Adapter.left({});
+            await waitForDocsResponse();
+          }
+        }
+      }
+    }
+
+    // Re-execute the deletion phase of a change-family command (c/s/S/C and operator change).
+    async _replayChangeDeletion(c) {
+      const reg = c.register;
+      switch (c.entryId) {
+        case 'substitute_char': {
+          const n = c.entryCount || 1;
+          repeat(n, () => Adapter.right({ shift: true }));
+          await waitForDocsResponse();
+          this.insertReplacementText('');
+          await waitForDocsResponse();
+          return;
+        }
+        case 'substitute_line': {
+          this.selectWholeLines(c.entryCount || 1);
+          await waitForDocsResponse();
+          this.insertReplacementText('');
+          await waitForDocsResponse();
+          return;
+        }
+        case 'change_to_eol': {
+          const n = c.entryCount || 1;
+          Adapter.end({ shift: true });
+          if (n > 1) {
+            repeat(n - 1, () => { Adapter.right({ shift: true }); Adapter.end({ shift: true }); });
+          }
+          this._lastSelType = 'char';
+          await waitForDocsResponse();
+          this.applyOperator('change', reg);
+          await waitForDocsResponse();
+          return;
+        }
+        case 'change_operator_motion': {
+          this._lastSelType = 'char';
+          this.selectByMotion(c.motion, c.entryCount || 1);
+          await waitForDocsResponse();
+          this.applyOperator('change', reg);
+          await waitForDocsResponse();
+          return;
+        }
+        case 'change_operator_self': {
+          this.selectWholeLines(c.entryCount || 1);
+          this._lastSelType = 'line';
+          await waitForDocsResponse();
+          this.applyOperator('change', reg);
+          await waitForDocsResponse();
+          return;
+        }
+        case 'change_operator_textobj': {
+          if (!c.textobj) return;
+          const ok = this.selectTextObject(c.textobj);
+          if (!ok) return;
+          this._lastSelType = (c.textobj.type === 'paragraph_inner' || c.textobj.type === 'paragraph_around') ? 'line' : 'char';
+          await waitForDocsResponse();
+          this.applyOperator('change', reg);
+          await waitForDocsResponse();
+          return;
+        }
+        default: return;
       }
     }
 
@@ -1365,10 +1632,11 @@
       // Debug: print caret index after motion (with small delay to let Google Docs process key events)
       try {
         if (window.__VIM_DEBUG__) {
-          setTimeout(() => {
+          // Fire-and-forget debug log after Docs reacts to the motion.
+          waitForDocsResponse({ timeoutMs: 30 }).then(() => {
             const ci = this.nav.caretIndex();
             console.log('[VimDebug] motion', id, 'index=', ci.index, 'min=', ci.min, 'max=', ci.max);
-          }, 10);
+          });
         }
       } catch (_) {}
     }
@@ -1462,37 +1730,64 @@
       }
     }
 
-    execOperatorMotion(result) {
-      const { operator, motion, count = 1, opCount } = result;
+    async execOperatorMotion(result) {
+      const { operator, count = 1, opCount } = result;
+      let motion = result.motion;
       const times = opCount || count || 1;
       this._lastSelType = 'char';
+      // Vim quirk: 'cw' and 'cW' behave like 'ce' and 'cE' so trailing whitespace
+      // is preserved (lets you change a word without losing the space after it).
+      if (operator === 'change') {
+        if (motion && motion.id === 'word_start_fwd') {
+          motion = { id: 'word_end_fwd', args: motion.args || {} };
+        } else if (motion && motion.id === 'WORD_start_fwd') {
+          motion = { id: 'WORD_end_fwd', args: motion.args || {} };
+        }
+      }
+      if (operator === 'change') {
+        // 'c'+motion enters insert mode; track typed text so '.' can replay the full change.
+        this.startInsert({
+          id: 'change_operator_motion', count: times, kind: 'change',
+          operator: 'change', motion: { id: motion.id, args: motion.args || {} }, register: result.register
+        });
+      } else {
+        this.setLastChange({ type: 'operator_motion', operator, motion: { id: motion.id, args: motion.args || {} }, count: times, register: result.register });
+      }
       this.selectByMotion(motion, times);
-      // Allow Docs time to apply the selection before operating
-      setTimeout(() => {
-        this.applyOperator(operator, result.register);
-      }, 20);
-      this.setLastChange({ type: 'operator_motion', operator, motion: { id: motion.id, args: motion.args || {} }, count: times, register: result.register });
+      // Wait for Docs to apply the selection (selectionchange + mutation observers).
+      await waitForDocsResponse();
+      this.applyOperator(operator, result.register);
     }
 
     execOperatorSelf(result) {
       const { operator, count = 1 } = result;
       this.selectWholeLines(count);
       this._lastSelType = 'line';
+      if (operator === 'change') {
+        // 'cc' enters insert mode; track typed text for '.' replay.
+        this.startInsert({ id: 'change_operator_self', count, kind: 'change', operator: 'change', register: result.register });
+      } else {
+        this.setLastChange({ type: 'operator_self', operator, count, register: result.register });
+      }
       this.applyOperator(operator, result.register);
-      this.setLastChange({ type: 'operator_self', operator, count, register: result.register });
     }
 
-    execOperatorTextObj(result) {
+    async execOperatorTextObj(result) {
       const { operator, textobj } = result;
       if (!textobj || !textobj.type) { this.stub('operator_textobj'); return; }
       const ok = this.selectTextObject(textobj);
       if (!ok) { this.stub('operator_textobj:' + textobj.type); return; }
       // Mark linewise for paragraph objects
       if (textobj.type === 'paragraph_inner' || textobj.type === 'paragraph_around') this._lastSelType = 'line'; else this._lastSelType = 'char';
-      setTimeout(() => {
-        this.applyOperator(operator, result.register);
-      }, 10);
-      this.setLastChange({ type: 'operator_textobj', operator, textobj, register: result.register });
+      if (operator === 'change') {
+        // 'ci"', 'caw', etc. enter insert mode; track typed text for '.' replay.
+        this.startInsert({ id: 'change_operator_textobj', count: 1, kind: 'change', operator: 'change', textobj, register: result.register });
+      } else {
+        this.setLastChange({ type: 'operator_textobj', operator, textobj, register: result.register });
+      }
+      // Wait for selection extension to settle before applying.
+      await waitForDocsResponse();
+      this.applyOperator(operator, result.register);
     }
 
     selectTextObject(textobj) {
@@ -2024,16 +2319,23 @@
       }
     }
 
-    execCommand(id, result) {
+    async execCommand(id, result) {
       const count = result.count || 1;
       switch (id) {
         // Insert family
-        case 'insert_before': this.modeAPI.setMode('insert'); return;
-        case 'insert_start_line': Adapter.home({}); this.modeAPI.setMode('insert'); return;
-        case 'append_after': Adapter.right({}); this.modeAPI.setMode('insert'); return;
-        case 'append_end_line': Adapter.end({}); this.modeAPI.setMode('insert'); return;
-        case 'open_below': Adapter.end({}); repeat(count, () => sendKeyEvent('enter', {})); this.modeAPI.setMode('insert'); return;
+        case 'insert_text': {
+          if (result.command && result.command.args && result.command.args.text) {
+            this.insertReplacementText(result.command.args.text);
+          }
+          return;
+        }
+        case 'insert_before': this.startInsert('insert_before', count); this.modeAPI.setMode('insert'); return;
+        case 'insert_start_line': this.startInsert('insert_start_line', count); Adapter.home({}); this.modeAPI.setMode('insert'); return;
+        case 'append_after': this.startInsert('append_after', count); Adapter.right({}); this.modeAPI.setMode('insert'); return;
+        case 'append_end_line': this.startInsert('append_end_line', count); Adapter.end({}); this.modeAPI.setMode('insert'); return;
+        case 'open_below': this.startInsert('open_below', count); Adapter.end({}); repeat(count, () => sendKeyEvent('enter', {})); this.modeAPI.setMode('insert'); return;
         case 'open_above': {
+          this.startInsert('open_above', count);
           const times = count || 1;
           for (let i = 0; i < times; i++) {
             Adapter.home({});
@@ -2043,7 +2345,7 @@
           this.modeAPI.setMode('insert');
           return;
         }
-        case 'append_end_word': this.execMotion('word_end_fwd', 1, false); this.modeAPI.setMode('insert'); return;
+        case 'append_end_word': this.startInsert('append_end_word', count); this.execMotion('word_end_fwd', 1, false); this.modeAPI.setMode('insert'); return;
         case 'insert_register': {
           const name = (result.command && result.command.args && result.command.args.char) || '"';
           const reg = this.registers[name] || this.registers['"'];
@@ -2065,6 +2367,8 @@
         }
         case 'replace_mode': {
           if (this.modeAPI && typeof this.modeAPI.setReplaceMode === 'function') this.modeAPI.setReplaceMode(true);
+          // Track the whole R session for '.' repeat; finishInsert on ESC will record ops.
+          this.startInsert({ id: 'replace_mode', count, kind: 'replace' });
           this.modeAPI.setMode('insert');
           return;
         }
@@ -2081,14 +2385,15 @@
           return;
         }
         case 'substitute_char': {
+          this.startInsert({ id: 'substitute_char', count, kind: 'change' });
           repeat(count, () => Adapter.right({ shift: true }));
           this.insertReplacementText('');
           this.modeAPI.setMode('insert');
-          this.setLastChange({ type: 'command', id: 'substitute_char', count });
           return;
         }
         case 'insert_replace_char': {
           // Overwrite next character with provided char; if no char to the right or newline, insert instead.
+          // Does NOT set _lastChange here; the entire R session is recorded at ESC via finishInsert.
           const ch = result.command && result.command.args && result.command.args.char;
           if (!ch || typeof ch !== 'string') return;
           const next = this.nav.peekRightCharN(1);
@@ -2098,24 +2403,23 @@
           }
           this.insertReplacementText(ch);
           // remain in insert mode; replaceMode stays true until ESC handled by content script
-          this.setLastChange({ type: 'command', id: 'insert_replace_char', args: { char: ch }, count: 1 });
           return;
         }
         case 'substitute_line': {
+          this.startInsert({ id: 'substitute_line', count, kind: 'change' });
           this.selectWholeLines(count);
           this.insertReplacementText('');
           this.modeAPI.setMode('insert');
-          this.setLastChange({ type: 'command', id: 'substitute_line', count });
           return;
         }
         case 'change_to_eol': {
+          this.startInsert({ id: 'change_to_eol', count, kind: 'change', register: result.register });
           Adapter.end({ shift: true });
           if (count > 1) {
             repeat(count - 1, () => { Adapter.right({ shift: true }); Adapter.end({ shift: true }); });
           }
           this._lastSelType = 'char';
           this.applyOperator('change', result.register);
-          this.setLastChange({ type: 'command', id: 'change_to_eol', count });
           return;
         }
         case 'delete_to_eol': {
@@ -2142,21 +2446,23 @@
         case 'toggle_case_char': {
           this.pushChangePosition();
           this._lastSelType = 'char';
-          repeat(count, () => Adapter.right({ shift: true }));
-          setTimeout(() => {
-            this.applyOperator('toggle_case', result.register);
-          }, 20);
-          setTimeout(() => Adapter.left({}), 20);
           this.setLastChange({ type: 'command', id: 'toggle_case_char', count });
+          repeat(count, () => Adapter.right({ shift: true }));
+          // Wait for selection extension to settle before toggling case.
+          await waitForDocsResponse();
+          this.applyOperator('toggle_case', result.register);
+          // Wait for the case change to apply, then return caret.
+          await waitForDocsResponse();
+          Adapter.left({});
           return;
         }
 
         // Paste (uses internal registers; Docs-friendly insertion)
-        case 'paste_after': { this.pasteFromRegister(result.register, { before: false, times: count }); this.setLastChange({ type: 'command', id: 'paste_after', count, register: result.register }); return; }
-        case 'paste_before': { this.pasteFromRegister(result.register, { before: true, times: count }); this.setLastChange({ type: 'command', id: 'paste_before', count, register: result.register }); return; }
-        case 'paste_after_cursor_stay': { this.pasteFromRegister(result.register, { before: false, cursorStay: true, times: count }); this.setLastChange({ type: 'command', id: 'paste_after_cursor_stay', count, register: result.register }); return; }
-        case 'paste_before_cursor_stay': { this.pasteFromRegister(result.register, { before: true, cursorStay: true, times: count }); this.setLastChange({ type: 'command', id: 'paste_before_cursor_stay', count, register: result.register }); return; }
-        case 'paste_adjust_indent': { this.pasteFromRegister(result.register, { before: false, adjustIndent: true, times: count }); this.setLastChange({ type: 'command', id: 'paste_adjust_indent', count, register: result.register }); return; }
+        case 'paste_after': { this.setLastChange({ type: 'command', id: 'paste_after', count, register: result.register }); await this.pasteFromRegister(result.register, { before: false, times: count }); return; }
+        case 'paste_before': { this.setLastChange({ type: 'command', id: 'paste_before', count, register: result.register }); await this.pasteFromRegister(result.register, { before: true, times: count }); return; }
+        case 'paste_after_cursor_stay': { this.setLastChange({ type: 'command', id: 'paste_after_cursor_stay', count, register: result.register }); await this.pasteFromRegister(result.register, { before: false, cursorStay: true, times: count }); return; }
+        case 'paste_before_cursor_stay': { this.setLastChange({ type: 'command', id: 'paste_before_cursor_stay', count, register: result.register }); await this.pasteFromRegister(result.register, { before: true, cursorStay: true, times: count }); return; }
+        case 'paste_adjust_indent': { this.setLastChange({ type: 'command', id: 'paste_adjust_indent', count, register: result.register }); await this.pasteFromRegister(result.register, { before: false, adjustIndent: true, times: count }); return; }
 
         // Number increment/decrement
         case 'increment': { this.incDecNumber(count); this.setLastChange({ type: 'command', id: 'increment', count }); return; }
@@ -2167,35 +2473,34 @@
           for (let i = 0; i < count; i++) {
             clickMenu(MENU_ITEMS.undo);
           }
-          // Deselect any selected text after undo
-          setTimeout(() => {
-            Adapter.left({});
-            setTimeout(() => Adapter.right({}), 10);
-          }, 50);
+          // Wait for the Docs undo to apply, then deselect any restored selection.
+          await waitForDocsResponseLong();
+          Adapter.left({});
+          await waitForDocsResponse();
+          Adapter.right({});
           return;
         }
         case 'undo_line': {
           clickMenu(MENU_ITEMS.undo);
-          setTimeout(() => {
-            Adapter.left({});
-            setTimeout(() => Adapter.right({}), 10);
-          }, 50);
+          await waitForDocsResponseLong();
+          Adapter.left({});
+          await waitForDocsResponse();
+          Adapter.right({});
           return;
         }
         case 'redo': {
           for (let i = 0; i < count; i++) {
             clickMenu(MENU_ITEMS.redo);
           }
-          // Deselect any selected text after redo
-          setTimeout(() => {
-            Adapter.left({});
-            setTimeout(() => Adapter.right({}), 10);
-          }, 50);
+          await waitForDocsResponseLong();
+          Adapter.left({});
+          await waitForDocsResponse();
+          Adapter.right({});
           return;
         }
         case 'repeat': {
           const override = result.count || 1;
-          this.replayLastChange(override);
+          await this.replayLastChange(override);
           return;
         }
 
@@ -2505,7 +2810,7 @@
       });
     }
 
-    pasteFromRegister(register, opts={}) {
+    async pasteFromRegister(register, opts={}) {
       const name = (register && typeof register === 'string') ? register : '"';
       const reg = this.registers[name] || this.registers['"'];
       const textVal = typeof reg === 'string' ? reg : (reg?.text || '');
@@ -2532,11 +2837,10 @@
         const payload = times > 1 ? textVal.repeat(times) : textVal;
         this.insertReplacementText(payload);
         if (cursorStay) {
-          // Move back by text length to restore cursor position
-          setTimeout(() => {
-            const len = payload.length;
-            if (len > 0) nav.moveLeftBy(len, false);
-          }, 20);
+          // Wait for paste to apply, then move back by text length to restore cursor.
+          await waitForDocsResponse();
+          const len = payload.length;
+          if (len > 0) nav.moveLeftBy(len, false);
         }
         return;
       }
@@ -2563,13 +2867,12 @@
         this.insertReplacementText(payload);
       }
       if (cursorStay) {
-        // For linewise, move up by number of lines pasted
-        setTimeout(() => {
-          const lines = repeated.split('\n').length - 1;
-          if (lines > 0) {
-            for (let i = 0; i < lines; i++) Adapter.up({});
-          }
-        }, 20);
+        // For linewise, wait for paste, then move up by number of lines pasted.
+        await waitForDocsResponse();
+        const lines = repeated.split('\n').length - 1;
+        if (lines > 0) {
+          for (let i = 0; i < lines; i++) Adapter.up({});
+        }
       }
     }
 
