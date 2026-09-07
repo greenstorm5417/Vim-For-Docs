@@ -3,7 +3,7 @@
   "name": "Vim-For-Docs",
   "description": "An implementation of Vim motions for Google Docs",
   "version": "2.7",
-  "permissions": ["storage"],
+  "permissions": ["storage", "clipboardWrite"],
   "browser_specific_settings": {
     "gecko": {
       "id": "greenstorm@vimfordocs.org"
@@ -43,14 +43,8 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": [
-        "page_script.js",
-        "browser-api.js",
-        "motions.json"
-      ],
-      "matches": [
-        "https://docs.google.com/*"
-      ]
+      "resources": ["page_script.js", "browser-api.js", "motions.json"],
+      "matches": ["https://docs.google.com/*"]
     }
   ]
 }

@@ -76,6 +76,19 @@
       this.commandNode = this._getCommandRoot();
     }
 
+    // True if `token` can start a motion, command, operator, or text object
+    // in the current runtime mode. Does not mutate parser state.
+    isBinding(token) {
+      const roots = [
+        this.motionsRoot,
+        this._getCommandRoot(),
+        this.operatorsRoot,
+        this.operatorSelfRoot,
+        this.textObjectsRoot
+      ];
+      return roots.some((r) => r && r.children.has(token));
+    }
+
     _getCommandRoot() {
       return this.commandsRootByMode[this.runtimeMode] || this.commandsRootByMode['normal'];
     }
@@ -159,7 +172,7 @@
           const meta = this.commandNode.meta;
           const modes = meta.modes || ['normal'];
           if (!this.haveOperator && modes.includes(this.runtimeMode)) {
-            const res = { kind: 'command', command: { id: meta.id, args: { ...this.args }, modes: modes }, count: this._countVal(), register: this.register, keys: [...this.buffer] };
+            const res = { kind: 'command', command: { id: meta.id, args: { ...this.args }, modes: modes }, count: this._countVal(), countProvided: !!this.countStr, register: this.register, keys: [...this.buffer] };
             this.reset();
             return res;
           }
@@ -210,7 +223,7 @@
       // This permits command completion even if a motion prefix exists (e.g., 'g').
       if (!this.haveOperator && !this.textObjectStarted() && this.commandNode && this.commandNode.meta && this.commandNode.meta.type === 'command') {
         const meta = this.commandNode.meta;
-        const res = { kind: 'command', command: { id: meta.id, args: { ...this.args }, modes: meta.modes }, count: this._countVal(), register: this.register, keys: [...this.buffer] };
+        const res = { kind: 'command', command: { id: meta.id, args: { ...this.args }, modes: meta.modes }, count: this._countVal(), countProvided: !!this.countStr, register: this.register, keys: [...this.buffer] };
         this.reset();
         return res;
       }
@@ -237,14 +250,14 @@
 
       if (this.motionNode && this.motionNode.meta && this.motionNode.meta.type === 'motion' && !this.haveOperator) {
         const meta = this.motionNode.meta;
-        const res = { kind: 'motion', motion: { id: meta.id, args: { ...this.args } }, count: this._countVal(), countSemantic: meta.countSemantic || null, register: this.register, keys: [...this.buffer] };
+        const res = { kind: 'motion', motion: { id: meta.id, args: { ...this.args } }, count: this._countVal(), countSemantic: meta.countSemantic || null, countProvided: !!this.countStr, register: this.register, keys: [...this.buffer] };
         this.reset();
         return res;
       }
 
       if (this.motionNode && this.motionNode.meta && this.motionNode.meta.type === 'motion' && this.haveOperator) {
         const meta = this.motionNode.meta;
-        const res = { kind: 'operator_motion', operator: this.operatorMeta.id, motion: { id: meta.id, args: { ...this.args } }, count: this._countVal(), opCount: this._opCountVal(), register: this.register, keys: [...this.buffer] };
+        const res = { kind: 'operator_motion', operator: this.operatorMeta.id, motion: { id: meta.id, args: { ...this.args } }, count: this._countVal(), opCount: this._opCountVal(), countProvided: !!this.countStr, register: this.register, keys: [...this.buffer] };
         this.reset();
         return res;
       }
@@ -262,6 +275,20 @@
     _stepMotionTrie(token) {
       let progressed = false; let awaitedChar = false;
       const tryStep = (node, t) => node ? node.children.get(t) : null;
+
+      // A placeholder node represents a completed f/t/F/T prefix that is
+      // waiting for exactly one literal character. Consume that character
+      // here; it is not a second trie key.
+      if (this.awaitingCharFor === 'motion' && this.motionNode && this.motionNode.children.has(PLACEHOLDER_CHAR)) {
+        if (isSingleCharToken(token)) {
+          this.motionNode = this.motionNode.children.get(PLACEHOLDER_CHAR);
+          this.args.char = token;
+          this.awaitingCharFor = null;
+          return { progressed: true, awaitedChar: false };
+        }
+        return { progressed: false, awaitedChar: false };
+      }
+
       let next = tryStep(this.motionNode, token);
       if (!next && this.motionNode && this.motionNode.children.has(PLACEHOLDER_CHAR) && isSingleCharToken(token)) {
         next = this.motionNode.children.get(PLACEHOLDER_CHAR); this.args.char = token;
@@ -291,6 +318,17 @@
     _stepCommandTrie(token) {
       let progressed = false; let awaitedChar = false;
       const tryStep = (node, t) => node ? node.children.get(t) : null;
+
+      if (this.awaitingCharFor === 'command' && this.commandNode && this.commandNode.children.has(PLACEHOLDER_CHAR)) {
+        if (isSingleCharToken(token)) {
+          this.commandNode = this.commandNode.children.get(PLACEHOLDER_CHAR);
+          this.args.char = token;
+          this.awaitingCharFor = null;
+          return { progressed: true, awaitedChar: false };
+        }
+        return { progressed: false, awaitedChar: false };
+      }
+
       let next = tryStep(this.commandNode, token);
       if (!next && this.commandNode && this.commandNode.children.has(PLACEHOLDER_CHAR) && isSingleCharToken(token)) {
         next = this.commandNode.children.get(PLACEHOLDER_CHAR); this.args.char = token;

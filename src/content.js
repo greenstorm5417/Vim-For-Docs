@@ -1,12 +1,12 @@
 (() => {
-  const IS_BROWSER = typeof browser !== 'undefined';
+  const IS_BROWSER = typeof browser !== "undefined";
   const API = IS_BROWSER ? browser : chrome;
 
   let parser = null;
   let debug = false;
   let useDisplayLines = false;
   let executor = null;
-  let mode = 'normal'; // normal | insert | visual | visualLine
+  let mode = "normal"; // normal | insert | visual | visualLine
   let tempNormal = false; // from <C-O>
   let replaceMode = false; // insert-overwrite (R)
   // Ops array recording user activity during insert / replace mode for '.' repeat.
@@ -14,24 +14,27 @@
   // Backspaces collapse trailing text first; once the buffer is empty, additional
   // backspaces accumulate as bs ops so we can faithfully replay over pre-existing text.
   let insertOps = [];
-  function resetInsertOps() { insertOps = []; }
+  function resetInsertOps() {
+    insertOps = [];
+  }
   function appendOpText(s) {
     if (!s) return;
     const last = insertOps[insertOps.length - 1];
-    if (last && last.type === 'text') last.value += s;
-    else insertOps.push({ type: 'text', value: s });
+    if (last && last.type === "text") last.value += s;
+    else insertOps.push({ type: "text", value: s });
   }
   function appendOpBs() {
     const last = insertOps[insertOps.length - 1];
-    if (last && last.type === 'text' && last.value.length > 0) {
+    if (last && last.type === "text" && last.value.length > 0) {
       last.value = last.value.slice(0, -1);
       if (!last.value) insertOps.pop();
       return;
     }
-    if (last && last.type === 'bs') last.count++;
-    else insertOps.push({ type: 'bs', count: 1 });
+    if (last && last.type === "bs") last.count++;
+    else insertOps.push({ type: "bs", count: 1 });
   }
-  let uiTheme = 'vim';
+  let insertRegisterPending = false; // <C-R>{register} in Insert mode
+  let uiTheme = "vim";
   let ui = null;
   let vimEnabled = true;
 
@@ -41,24 +44,32 @@
   // mode-state lag (e.g., user typing fast after entering insert mode).
   function runExec(result) {
     let p;
-    try { p = executor.exec(result); } catch (e) { console.error('[VimExecutor] sync error', e); return; }
-    if (p && typeof p.catch === 'function') p.catch((err) => console.error('[VimExecutor] async error', err));
+    try {
+      p = executor.exec(result);
+    } catch (e) {
+      console.error("[VimExecutor] sync error", e);
+      return;
+    }
+    if (p && typeof p.catch === "function")
+      p.catch((err) => console.error("[VimExecutor] async error", err));
   }
 
-  function log(...args) { if (debug) console.log('[VimParser]', ...args); }
+  function log(...args) {
+    if (debug) console.log("[VimParser]", ...args);
+  }
 
   function mapCtrlKeyName(key) {
     // Normalize control key tokens like <C-E>
     const specials = {
-      ' ': 'SPACE',
-      'ArrowUp': 'Up',
-      'ArrowDown': 'Down',
-      'ArrowLeft': 'Left',
-      'ArrowRight': 'Right',
-      'Escape': 'ESC',
-      'Enter': 'CR',
-      'Backspace': 'BS',
-      'Tab': 'TAB'
+      " ": "SPACE",
+      ArrowUp: "Up",
+      ArrowDown: "Down",
+      ArrowLeft: "Left",
+      ArrowRight: "Right",
+      Escape: "ESC",
+      Enter: "CR",
+      Backspace: "BS",
+      Tab: "TAB",
     };
     if (specials[key]) return specials[key];
     if (key.length === 1) return key.toUpperCase();
@@ -66,6 +77,9 @@
   }
 
   function eventToToken(e) {
+    // Allow Command (Meta) keys to pass through for system/application shortcuts
+    if (e.metaKey) return null;
+
     // Control key combinations
     if (e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey) {
       return `<C-${mapCtrlKeyName(e.key)}>`;
@@ -74,103 +88,211 @@
     if (e.key.length === 1) return e.key;
     // Direct named keys we might care about
     const named = {
-      'Escape': '<ESC>',
-      'Enter': '<CR>',
-      'Backspace': '<BS>',
-      'Tab': '<TAB>'
+      Escape: "<ESC>",
+      Enter: "<CR>",
+      Backspace: "<BS>",
+      Tab: "<TAB>",
     };
     return named[e.key] || null;
   }
 
-  
-
   function findEditorDoc() {
-    const editorIframe = document.querySelector('.docs-texteventtarget-iframe');
-    if (editorIframe && editorIframe.contentDocument) return editorIframe.contentDocument;
-    const anyIframe = document.getElementsByTagName('iframe')[0];
-    if (anyIframe && anyIframe.contentDocument) return anyIframe.contentDocument;
+    const editorIframe = document.querySelector(".docs-texteventtarget-iframe");
+    if (editorIframe && editorIframe.contentDocument)
+      return editorIframe.contentDocument;
+    const anyIframe = document.getElementsByTagName("iframe")[0];
+    if (anyIframe && anyIframe.contentDocument)
+      return anyIframe.contentDocument;
     return document;
   }
 
   function attachKeyListener() {
     const doc = findEditorDoc();
-    doc.addEventListener('keydown', (e) => {
-      if (!vimEnabled) return; // respect global enable toggle
-      // Ignore synthetic events generated by our executor to avoid recursion
-      if (!e.isTrusted) return;
-      const token = eventToToken(e);
-      if (!token) return; // allow non-token keys like arrows to flow
-      try {
-        // Insert mode handling: only intercept exits and temp-normal
-        if (mode === 'insert') {
-          if (token === '<ESC>' || token === '<C-C>' || token === '<C-[>') {
-            e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
-            try { executor.finishInsert(insertOps); } catch (_) {}
-            resetInsertOps();
-            setMode('normal'); replaceMode = false;
+    doc.addEventListener(
+      "keydown",
+      (e) => {
+        if (!vimEnabled) return; // respect global enable toggle
+        // Ignore synthetic events generated by our executor to avoid recursion
+        if (!e.isTrusted) return;
+        const token = eventToToken(e);
+        if (!token) return; // allow non-token keys like arrows to flow
+        try {
+          // Insert mode handling: only intercept exits and temp-normal
+          if (mode === "insert") {
+            if (insertRegisterPending) {
+              if (e.key && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                e.preventDefault();
+                e.stopPropagation();
+                e.stopImmediatePropagation();
+                insertRegisterPending = false;
+                runExec({
+                  kind: "command",
+                  command: {
+                    id: "insert_register",
+                    args: { char: e.key },
+                    modes: ["insert"],
+                  },
+                  count: 1,
+                });
+              }
+              return;
+            }
+            if (token === "<ESC>" || token === "<C-C>" || token === "<C-[>") {
+              e.preventDefault();
+              e.stopPropagation();
+              e.stopImmediatePropagation();
+              try {
+                executor.finishInsert(insertOps);
+              } catch (_) {}
+              resetInsertOps();
+              replaceMode = false;
+              setMode("normal");
+              return;
+            }
+            if (token === "<C-O>") {
+              // Temporary normal mode for one command
+              e.preventDefault();
+              e.stopPropagation();
+              e.stopImmediatePropagation();
+              tempNormal = true;
+              setMode("normal");
+              return;
+            }
+            if (token === "<C-R>") {
+              e.preventDefault();
+              e.stopPropagation();
+              e.stopImmediatePropagation();
+              insertRegisterPending = true;
+              return;
+            }
+            const insertCommandIds = {
+              "<C-H>": "insert_delete_char_back",
+              "<C-W>": "insert_delete_word",
+              "<C-J>": "insert_line_break",
+              "<C-T>": "insert_indent",
+              "<C-D>": "insert_dedent",
+              "<C-N>": "insert_autocomplete_next",
+              "<C-P>": "insert_autocomplete_prev",
+            };
+            if (insertCommandIds[token]) {
+              e.preventDefault();
+              e.stopPropagation();
+              e.stopImmediatePropagation();
+              runExec({
+                kind: "command",
+                command: { id: insertCommandIds[token], modes: ["insert"] },
+                count: 1,
+              });
+              return;
+            }
+            // Track printable characters typed in insert/replace mode for '.' repeat
+            if (
+              e.key &&
+              e.key.length === 1 &&
+              !e.ctrlKey &&
+              !e.metaKey &&
+              !e.altKey
+            ) {
+              appendOpText(e.key);
+            } else if (token === "<CR>" && !replaceMode) {
+              appendOpText("\n");
+            } else if (token === "<BS>") {
+              appendOpBs();
+            }
+            // Replace mode: intercept printable characters and perform overwrite via executor
+            if (
+              replaceMode &&
+              e.key &&
+              e.key.length === 1 &&
+              !e.ctrlKey &&
+              !e.metaKey &&
+              !e.altKey
+            ) {
+              e.preventDefault();
+              e.stopPropagation();
+              e.stopImmediatePropagation();
+              try {
+                runExec({
+                  kind: "command",
+                  command: {
+                    id: "insert_replace_char",
+                    args: { char: e.key },
+                    modes: ["insert"],
+                  },
+                  count: 1,
+                });
+              } catch (_) {}
+              return;
+            }
+            return; // allow typing
+          }
+
+          // Let unbound Ctrl+Key chords (Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+1/2/3,
+          // Ctrl+W, ...) reach the page/browser; only intercept control chords
+          // that Vim binds in the current mode, plus exit keys (ESC/Ctrl+[/Ctrl+C)
+          const exitToken =
+            token === "<ESC>" || token === "<C-[>" || token === "<C-C>";
+          if (
+            !exitToken &&
+            e.ctrlKey &&
+            parser &&
+            typeof parser.isBinding === "function" &&
+            !parser.isBinding(token)
+          ) {
+            return; // pass through: not a Vim binding in this mode
+          }
+
+          // In non-insert modes, suppress all tokenized keys by default
+          e.preventDefault();
+          e.stopPropagation();
+          e.stopImmediatePropagation();
+
+          // ESC (or Ctrl+[ / Ctrl+C) should be exit mode regardless of current mode
+          if (exitToken) {
+            runExec({
+              kind: "command",
+              command: { id: "exit_mode" },
+              count: 1,
+            });
             return;
           }
-          if (token === '<C-O>') {
-            // Temporary normal mode for one command
-            e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
-            tempNormal = true; setMode('normal');
+
+          const res = parser.feed(token);
+          if (!res) return;
+
+          if (res.kind === "invalid") {
+            if (ui) ui.setBufferText("");
             return;
           }
-          // Track printable characters typed in insert/replace mode for '.' repeat
-          if (e.key && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
-            appendOpText(e.key);
-          } else if (token === '<CR>' && !replaceMode) {
-            appendOpText('\n');
-          } else if (token === '<BS>') {
-            appendOpBs();
-          }
-          // Replace mode: intercept printable characters and perform overwrite via executor.
-          // The insert_replace_char command no longer sets _lastChange itself; the session-level
-          // finishInsert(ops) records the full replace session at ESC time.
-          if (replaceMode && e.key && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
-            e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
-            runExec({ kind: 'command', command: { id: 'insert_replace_char', args: { char: e.key }, modes: ['insert'] }, count: 1 });
+
+          if (res.kind === "prefix" || res.kind === "await_char") {
+            if (ui) ui.setBufferText((res.keys || []).join(""));
+            log("prefix", res);
             return;
           }
-          return; // allow typing
+
+          // Completed parse -> execute (async, fire-and-forget; intra-command waits handle timing)
+          log("complete", res);
+          runExec(res);
+          if (ui) ui.setBufferText("");
+
+          if (tempNormal) {
+            tempNormal = false;
+            const savedOps = insertOps; // preserve insert ops across tempNormal command
+            setMode("insert");
+            insertOps = savedOps;
+          }
+        } catch (err) {
+          console.error("Parser error", err);
         }
-
-        // In non-insert modes, suppress all tokenized keys by default
-        e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
-
-        // ESC (or Ctrl+[) should be exit mode regardless of current mode
-        if (token === '<ESC>' || token === '<C-[>') {
-          runExec({ kind: 'command', command: { id: 'exit_mode' }, count: 1 });
-          return;
-        }
-
-        const res = parser.feed(token);
-        if (!res) return;
-
-        if (res.kind === 'invalid') { if (ui) ui.setBufferText(''); return; }
-
-        if (res.kind === 'prefix' || res.kind === 'await_char') { if (ui) ui.setBufferText((res.keys || []).join('')); log('prefix', res); return; }
-
-        // Completed parse -> execute (async, fire-and-forget; intra-command waits handle timing)
-        log('complete', res);
-        runExec(res);
-        if (ui) ui.setBufferText('');
-
-        if (tempNormal) {
-          tempNormal = false;
-          const savedOps = insertOps; // preserve insert ops across tempNormal command
-          setMode('insert');
-          insertOps = savedOps;
-        }
-      } catch (err) {
-        console.error('Parser error', err);
-      }
-    }, true);
+      },
+      true,
+    );
   }
 
   function injectPageScript() {
-    const script = document.createElement('script');
-    script.src = API.runtime.getURL('page_script.js');
+    const script = document.createElement("script");
+    script.src = API.runtime.getURL("page_script.js");
     document.documentElement.appendChild(script);
   }
 
@@ -185,36 +307,48 @@
 
     // Migration v1 -> v2: Add first_non_blank_down motion
     if (storedVersion < 2) {
-      const hasMotion = (migrated.motions || []).some(m => m.id === 'first_non_blank_down');
+      const hasMotion = (migrated.motions || []).some(
+        (m) => m.id === "first_non_blank_down",
+      );
       if (!hasMotion) {
-        const baseMotion = (base.motions || []).find(m => m.id === 'first_non_blank_down');
+        const baseMotion = (base.motions || []).find(
+          (m) => m.id === "first_non_blank_down",
+        );
         if (baseMotion) {
           migrated.motions = migrated.motions || [];
-          const insertIdx = migrated.motions.findIndex(m => m.id === 'line_end');
+          const insertIdx = migrated.motions.findIndex(
+            (m) => m.id === "line_end",
+          );
           if (insertIdx >= 0) {
             migrated.motions.splice(insertIdx, 0, baseMotion);
           } else {
             migrated.motions.push(baseMotion);
           }
-          log('Added first_non_blank_down motion (_) during migration');
+          log("Added first_non_blank_down motion (_) during migration");
         }
       }
     }
 
     // Migration v2 -> v3: Add toggle_case_char command
     if (storedVersion < 3) {
-      const hasCommand = (migrated.commands || []).some(c => c.id === 'toggle_case_char');
+      const hasCommand = (migrated.commands || []).some(
+        (c) => c.id === "toggle_case_char",
+      );
       if (!hasCommand) {
-        const baseCommand = (base.commands || []).find(c => c.id === 'toggle_case_char');
+        const baseCommand = (base.commands || []).find(
+          (c) => c.id === "toggle_case_char",
+        );
         if (baseCommand) {
           migrated.commands = migrated.commands || [];
-          const insertIdx = migrated.commands.findIndex(c => c.id === 'delete_char_back');
+          const insertIdx = migrated.commands.findIndex(
+            (c) => c.id === "delete_char_back",
+          );
           if (insertIdx >= 0) {
             migrated.commands.splice(insertIdx + 1, 0, baseCommand);
           } else {
             migrated.commands.push(baseCommand);
           }
-          log('Added toggle_case_char command (~) during migration');
+          log("Added toggle_case_char command (~) during migration");
         }
       }
     }
@@ -223,7 +357,7 @@
     try {
       API.storage.local.set({ motionsConfig: migrated });
     } catch (e) {
-      console.warn('Failed to save migrated config', e);
+      console.warn("Failed to save migrated config", e);
     }
 
     return migrated;
@@ -234,37 +368,50 @@
       const base = await window.loadVimMotionsConfig();
       // Read debug flag and useDisplayLines from sync (small, sync-friendly)
       try {
-        API.storage.sync.get(['debug', 'useDisplayLines'], (data) => {
+        API.storage.sync.get(["debug", "useDisplayLines"], (data) => {
           debug = !!(data && data.debug);
           useDisplayLines = !!(data && data.useDisplayLines);
-          try { window.__VIM_DEBUG__ = debug; } catch (_) {}
-          try { window.__VIM_USE_DISPLAY_LINES__ = useDisplayLines; } catch (_) {}
+          try {
+            window.__VIM_DEBUG__ = debug;
+          } catch (_) {}
+          try {
+            window.__VIM_USE_DISPLAY_LINES__ = useDisplayLines;
+          } catch (_) {}
         });
       } catch (_) {}
 
       // Read motionsConfig from local storage first, with a legacy sync fallback
       return new Promise((resolve) => {
         try {
-          API.storage.local.get(['motionsConfig'], (localData) => {
+          API.storage.local.get(["motionsConfig"], (localData) => {
             const finishWith = (src) => {
-              if (!src) { resolve(base); return; }
+              if (!src) {
+                resolve(base);
+                return;
+              }
               try {
-                const parsed = (typeof src === 'string') ? JSON.parse(src) : src;
+                const parsed = typeof src === "string" ? JSON.parse(src) : src;
                 const migrated = migrateConfig(parsed, base);
                 resolve(migrated);
               } catch (e) {
-                console.warn('Invalid motionsConfig in storage, using base file', e);
+                console.warn(
+                  "Invalid motionsConfig in storage, using base file",
+                  e,
+                );
                 resolve(base);
               }
             };
 
-            if (localData && typeof localData.motionsConfig !== 'undefined') {
+            if (localData && typeof localData.motionsConfig !== "undefined") {
               finishWith(localData.motionsConfig);
             } else {
               // Legacy fallback: look in sync storage if nothing is in local
               try {
-                API.storage.sync.get(['motionsConfig'], (syncData) => {
-                  if (syncData && typeof syncData.motionsConfig !== 'undefined') {
+                API.storage.sync.get(["motionsConfig"], (syncData) => {
+                  if (
+                    syncData &&
+                    typeof syncData.motionsConfig !== "undefined"
+                  ) {
                     finishWith(syncData.motionsConfig);
                   } else {
                     resolve(base);
@@ -280,47 +427,80 @@
         }
       });
     } catch (e) {
-      console.error('Failed to load motions config', e);
-      return { motions: [], operators: [], textObjects: [], operatorSelf: [], settings: {} };
+      console.error("Failed to load motions config", e);
+      return {
+        motions: [],
+        operators: [],
+        textObjects: [],
+        operatorSelf: [],
+        settings: {},
+      };
     }
   }
 
   async function init() {
     const cfg = await loadConfig();
     parser = new window.VimMotionParser(cfg);
-    log('Initialized with config', cfg);
+    log("Initialized with config", cfg);
     injectPageScript();
     attachKeyListener();
     try {
-      API.storage.sync.get(['theme','enabled'], (data) => {
-        try { uiTheme = (data && data.theme) ? data.theme : 'vim'; } catch (_) { uiTheme = 'vim'; }
-        try { vimEnabled = (data && typeof data.enabled !== 'undefined') ? !!data.enabled : true; } catch (_) { vimEnabled = true; }
+      API.storage.sync.get(["theme", "enabled"], (data) => {
+        try {
+          uiTheme = data && data.theme ? data.theme : "vim";
+        } catch (_) {
+          uiTheme = "vim";
+        }
+        try {
+          vimEnabled =
+            data && typeof data.enabled !== "undefined" ? !!data.enabled : true;
+        } catch (_) {
+          vimEnabled = true;
+        }
         if (ui) ui.setTheme(uiTheme);
-        try { if (ui && ui.ind) ui.ind.style.display = vimEnabled ? '' : 'none'; } catch (_) {}
+        try {
+          if (ui && ui.ind) ui.ind.style.display = vimEnabled ? "" : "none";
+        } catch (_) {}
       });
     } catch (_) {}
-    try { ui = new VimUIV2(); ui.setTheme(uiTheme); ui.setMode(mode); try { if (ui && ui.ind) ui.ind.style.display = vimEnabled ? '' : 'none'; } catch (_) {} } catch (_) {}
+    try {
+      ui = new VimUIV2();
+      ui.setTheme(uiTheme);
+      setMode(mode);
+      try {
+        if (ui && ui.ind) ui.ind.style.display = vimEnabled ? "" : "none";
+      } catch (_) {}
+    } catch (_) {}
 
     // Apply settings instantly when changed from popup/advanced (no tabs permission required)
     try {
       API.storage.onChanged.addListener((changes, area) => {
         // Sync-scoped settings (small, safe to sync)
-        if (area === 'sync') {
+        if (area === "sync") {
           if (changes && changes.debug) {
-            try { debug = !!changes.debug.newValue; window.__VIM_DEBUG__ = debug; } catch (_) {}
-            log('Debug changed via storage', debug);
+            try {
+              debug = !!changes.debug.newValue;
+              window.__VIM_DEBUG__ = debug;
+            } catch (_) {}
+            log("Debug changed via storage", debug);
           }
           if (changes && changes.useDisplayLines) {
-            try { useDisplayLines = !!changes.useDisplayLines.newValue; window.__VIM_USE_DISPLAY_LINES__ = useDisplayLines; } catch (_) {}
-            log('useDisplayLines changed via storage', useDisplayLines);
+            try {
+              useDisplayLines = !!changes.useDisplayLines.newValue;
+              window.__VIM_USE_DISPLAY_LINES__ = useDisplayLines;
+            } catch (_) {}
+            log("useDisplayLines changed via storage", useDisplayLines);
           }
           if (changes && changes.theme) {
-            try { uiTheme = changes.theme.newValue || 'vim'; if (ui) ui.setTheme(uiTheme); } catch (_) {}
+            try {
+              uiTheme = changes.theme.newValue || "vim";
+              if (ui) ui.setTheme(uiTheme);
+            } catch (_) {}
           }
           if (changes && changes.enabled) {
             try {
               vimEnabled = !!changes.enabled.newValue;
-              if (ui && ui.ind) ui.ind.style.display = vimEnabled ? '' : 'none';
+              if (ui && ui.ind) ui.ind.style.display = vimEnabled ? "" : "none";
             } catch (_) {}
           }
         }
@@ -329,21 +509,21 @@
         if (changes && changes.motionsConfig) {
           try {
             const nv = changes.motionsConfig.newValue;
-            if (typeof nv !== 'undefined') {
-              const newCfg = (typeof nv === 'string') ? JSON.parse(nv) : nv;
+            if (typeof nv !== "undefined") {
+              const newCfg = typeof nv === "string" ? JSON.parse(nv) : nv;
               parser.setConfig(newCfg);
               parser.reset();
-              log('Applied updated motions config from storage');
+              log("Applied updated motions config from storage");
             } else {
               // removed: fall back to base file
               loadConfig().then((baseCfg) => {
                 parser.setConfig(baseCfg);
                 parser.reset();
-                log('Reverted to base motions config');
+                log("Reverted to base motions config");
               });
             }
           } catch (e) {
-            console.warn('Failed to apply motionsConfig change', e);
+            console.warn("Failed to apply motionsConfig change", e);
           }
         }
       });
@@ -351,25 +531,30 @@
 
     // Allow live reload via message
     API.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-      if (msg && msg.action === 'reloadMotionsConfig') {
+      if (msg && msg.action === "reloadMotionsConfig") {
         loadConfig().then((newCfg) => {
           parser.setConfig(newCfg);
           parser.reset();
-          log('Reloaded config');
+          log("Reloaded config");
           sendResponse({ ok: true });
         });
         return true;
-      } else if (msg && msg.action === 'updateSettings' && msg.settings) {
+      } else if (msg && msg.action === "updateSettings" && msg.settings) {
         try {
-          if (typeof msg.settings.debug !== 'undefined') {
+          if (typeof msg.settings.debug !== "undefined") {
             debug = !!msg.settings.debug;
-            try { window.__VIM_DEBUG__ = debug; } catch (_) {}
+            try {
+              window.__VIM_DEBUG__ = debug;
+            } catch (_) {}
           }
-          if (typeof msg.settings.theme !== 'undefined') { uiTheme = msg.settings.theme || 'vim'; if (ui) ui.setTheme(uiTheme); }
-          log('Updated debug setting', debug);
+          if (typeof msg.settings.theme !== "undefined") {
+            uiTheme = msg.settings.theme || "vim";
+            if (ui) ui.setTheme(uiTheme);
+          }
+          log("Updated debug setting", debug);
           sendResponse({ ok: true });
         } catch (e) {
-          console.warn('Failed to apply settings update', e);
+          console.warn("Failed to apply settings update", e);
           sendResponse({ ok: false, error: String(e) });
         }
         return true;
@@ -379,8 +564,14 @@
 
     // Persist last-exit position when the tab/window is closing
     try {
-      window.addEventListener('beforeunload', () => {
-        try { executor.exec({ kind: 'command', command: { id: 'record_last_exit' }, count: 1 }); } catch (_) {}
+      window.addEventListener("beforeunload", () => {
+        try {
+          executor.exec({
+            kind: "command",
+            command: { id: "record_last_exit" },
+            count: 1,
+          });
+        } catch (_) {}
       });
     } catch (_) {}
   }
@@ -389,25 +580,42 @@
   function setMode(newMode) {
     if (newMode === 'insert' && mode !== 'insert') resetInsertOps();
     mode = newMode;
-    try { if (parser && typeof parser.setMode === 'function') parser.setMode(newMode); } catch (_) {}
-    if (debug) console.log('[VimMode] ->', mode, tempNormal ? '(temp)' : '');
-    try { if (ui) { ui.setTempNormal(!!tempNormal); ui.setMode(mode); ui.updateCursorStyle(); } } catch (_) {}
+    try {
+      if (parser && typeof parser.setMode === "function")
+        parser.setMode(newMode);
+    } catch (_) {}
+    if (debug) console.log("[VimMode] ->", mode, tempNormal ? "(temp)" : "");
+    try {
+      if (ui) {
+        ui.setTempNormal(!!tempNormal);
+        ui.setReplaceMode(!!replaceMode);
+        ui.setMode(mode);
+        ui.updateCursorStyle();
+      }
+    } catch (_) {}
   }
   const modeAPI = {
-    setMode: (m) => { setMode(m); },
+    setMode: (m) => {
+      setMode(m);
+    },
     getMode: () => mode,
-    isVisual: () => mode === 'visual' || mode === 'visualLine',
+    isVisual: () => mode === "visual" || mode === "visualLine",
     getReplaceMode: () => replaceMode,
-    setReplaceMode: (v) => { replaceMode = !!v; }
+    setReplaceMode: (v) => {
+      replaceMode = !!v;
+      try {
+        if (ui) ui.setReplaceMode(replaceMode);
+      } catch (_) {}
+    },
   };
   const settingsAPI = {
-    getUseDisplayLines: () => useDisplayLines
+    getUseDisplayLines: () => useDisplayLines,
   };
   // Initialize executor early so it is available in init
   executor = window.createVimExecutor(modeAPI, settingsAPI);
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
   } else {
     init();
   }
