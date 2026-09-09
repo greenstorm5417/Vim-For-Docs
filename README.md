@@ -23,6 +23,7 @@ Without these settings enabled, the extension will not function properly.
 
 ## Features
 - Vim-like navigation and editing for Google Docs.
+- Unbound Docs and browser shortcuts pass through in every mode, including Visual mode: `Ctrl+Alt+1` for headings, `Ctrl+Shift+C` for word count, and macOS `Cmd+L` / `Cmd+R`.
 - Customizable motions, operators, commands, and text objects via a built‑in Motions Editor.
 - Clean, non-destructive editor UX: no row deletion, IDs locked, keys edited in modals.
 - Live apply of settings and motions through storage listeners (no tabs permission).
