@@ -25,13 +25,35 @@ Without these settings enabled, the extension will not function properly.
 - Vim-like navigation and editing for Google Docs.
 - Customizable motions, operators, commands, and text objects via a built‑in Motions Editor.
 - Clean, non-destructive editor UX: no row deletion, IDs locked, keys edited in modals.
-- Live apply of settings and motions through storage sync listeners (no tabs permission).
-- Minimal permissions: storage only.
+- Live apply of settings and motions through storage listeners (no tabs permission).
+- Permissions: storage and clipboard writing for yank.
 
 ## Configuration & Motions Editor
 - Open the popup → Motions Editor to customize key sequences and text object delimiters.
-- Edits are validated as you type (token format, duplicates per section/type).
-- Changes are saved to browser sync storage and applied instantly.
+- Edits are validated before saving, including supported tokens and conflicting bindings.
+- Motions are saved locally and applied to open Docs tabs. Small preferences use sync storage.
+
+Use `<Left>`, `<Right>`, `<Up>`, `<Down>`, `<SPACE>`, `<ESC>`, `<CR>`, `<BS>`,
+`<TAB>`, `<Del>`, `<Home>`, `<End>`, `<PageUp>`, `<PageDown>`, or `<F1>`–`<F24>`
+for named keys. Modifier prefixes are `C` (Control), `A` (Alt), `M` (Meta/Command),
+and `S` (Shift), in that order: for example `<A-X>`, `<M-Z>`, `<C-S-X>`, or
+`<S-TAB>`. Use the uppercase letter itself for Shift plus a letter. Shortcuts
+intercepted by the browser or operating system cannot reach the extension.
+
+Insert sequences such as `j k` buffer typing until they match. If the sequence
+fails or times out, its ordinary typing is restored. Under **Advanced: Edit raw
+JSON**, the `settings` object also supports:
+
+- `mappingTimeoutMs`: insert mapping timeout, default `500` milliseconds.
+- `registerPrefix`: key introducing a register name, default `"`.
+- `allowRegisterPrefix`: set to `false` to release that key for another binding.
+- `allowCountPrefix`: set to `false` to bind digits instead of using them as counts.
+- `tokenAliases`: defaults to `{ "<C-[>": "<ESC>" }`. Set to `{}` to bind Ctrl+[ independently.
+- `cancelTokens`: keys that cancel a pending Normal/Visual sequence; defaults to `["<ESC>", "<C-C>"]`. Insert/Visual exit commands have their own editable bindings.
+
+Operator Self sequences can be rebound independently of their operators.
+Completed normal motions run immediately: `e a` retains its usual composition
+of move-to-word-end followed by append.
 
 ## Help
 - A concise Help is available inside each edit modal.

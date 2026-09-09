@@ -9,7 +9,7 @@
   }
 
   function keysToTokens(keys) {
-    return keys.map(k => (k === '<char>' ? PLACEHOLDER_CHAR : k));
+    return keys.map(k => (k === '<char>' ? PLACEHOLDER_CHAR : window.VimConfig.normalizeToken(k)));
   }
 
   function insertTrie(root, keys, meta) {
@@ -22,7 +22,8 @@
   }
 
   function isDigitToken(t) { return t.length === 1 && /[0-9]/.test(t); }
-  function isSingleCharToken(t) { return t.length === 1; }
+  function isSingleCharToken(t) { return t === '<SPACE>' || (typeof t === 'string' && Array.from(t).length === 1); }
+  function literalChar(token) { return token === '<SPACE>' ? ' ' : token; }
 
   class VimMotionParser {
     constructor(config) {
@@ -32,8 +33,10 @@
     }
 
     setConfig(config) {
+      const error = window.VimConfig.validate(config);
+      if (error) throw new Error(error);
       this.config = config || {};
-      this.settings = this.config.settings || {};
+      this.settings = { ...window.VimConfig.defaults, ...this.config.settings };
       this.motionsRoot = new TrieNode();
       this.operatorsRoot = new TrieNode();
       this.textObjectsRoot = new TrieNode();
@@ -78,6 +81,8 @@
     // True if `token` can start a mapping in the current runtime mode.
     // Insert mode only consults insert commands so hjkl/i/a still type.
     isBinding(token) {
+      if (!token) return false;
+      token = this.settings.tokenAliases?.[token] || token;
       if (this.runtimeMode === 'insert') {
         const root = this._getCommandRoot();
         return !!(root && root.children.has(token));
@@ -94,6 +99,19 @@
 
     isPending() {
       return !!(this.awaitingCharFor || this.awaitRegister || this.haveOperator || (this.buffer && this.buffer.length));
+    }
+
+    canContinue(token) {
+      if (!token || !this.isPending()) return false;
+      token = this.settings.tokenAliases?.[token] || token;
+      const nodes = this.runtimeMode === 'insert' ? [this.commandNode] :
+        [this.commandNode, this.motionNode, this.textObjNode, this.selfNode, this.operatorNode];
+      return nodes.some(node => node && (node.children.has(token) ||
+        (isSingleCharToken(token) && node.children.has(PLACEHOLDER_CHAR))));
+    }
+
+    isCancel(token) {
+      return this.settings.cancelTokens.includes(this.settings.tokenAliases?.[token] || token);
     }
 
     _getCommandRoot() {
@@ -115,9 +133,11 @@
       this.operatorMeta = null;
       this.awaitingCharFor = null;
       this.args = {};
+      this.mappingStarted = false;
     }
 
     feed(token) {
+      token = this.settings.tokenAliases?.[token] || token;
       const out = this._feed(token);
       return out;
     }
@@ -127,19 +147,19 @@
       const settings = this.settings;
       if (this.awaitRegister) {
         if (isSingleCharToken(token)) {
-          this.register = token; this.awaitRegister = false; this.buffer.push('"', token);
+          this.register = token; this.awaitRegister = false; this.buffer.push(token);
           return { kind: 'prefix', keys: [...this.buffer] };
         } else {
           this.reset();
           return { kind: 'invalid' };
         }
       }
-      if (!this.buffer.length && settings.allowRegisterPrefix && token === '"') {
+      if (!this.buffer.length && settings.allowRegisterPrefix && token === (settings.registerPrefix || '"')) {
         this.awaitRegister = true; this.buffer.push(token);
         return { kind: 'prefix', keys: [...this.buffer] };
       }
 
-      if (!this.haveOperator && !this.motionStarted() && !this.textObjectStarted() && !this.awaitingCharFor) {
+      if (settings.allowCountPrefix !== false && !this.haveOperator && !this.mappingStarted && !this.awaitingCharFor) {
         if (isDigitToken(token)) {
           if (token === '0' && this.countStr === '') {
             return this._stepGeneral(token);
@@ -149,8 +169,9 @@
         }
       }
 
-      if (this.haveOperator && !this.motionStarted() && !this.textObjectStarted() && !this.awaitingCharFor) {
+      if (settings.allowCountPrefix !== false && this.haveOperator && !this.mappingStarted && !this.awaitingCharFor) {
         if (isDigitToken(token)) {
+          if (token === '0' && this.opCountStr === '') return this._stepGeneral(token);
           this.opCountStr += token; this.buffer.push(token);
           return { kind: 'prefix', keys: [...this.buffer], count: this._countVal(), opCount: this._opCountVal() };
         }
@@ -178,11 +199,12 @@
       return { kind: 'prefix', keys: [...this.buffer] };
     }
 
-    motionStarted() { return this.motionNode !== this.motionsRoot; }
-    textObjectStarted() { return this.textObjNode !== this.textObjectsRoot; }
+    motionStarted() { return !!this.motionNode && this.motionNode !== this.motionsRoot; }
+    textObjectStarted() { return !!this.textObjNode && this.textObjNode !== this.textObjectsRoot; }
 
     _stepGeneral(token) {
       this.buffer.push(token);
+      this.mappingStarted = true;
       let progressed = false;
       let awaitedChar = false;
       const awaitingMotionChar = this.awaitingCharFor === 'motion';
@@ -206,25 +228,30 @@
         }
       }
 
+      const selfStep = this._stepSelfTrie(token);
+      progressed = progressed || selfStep.progressed;
+      if (this.selfNode && this.selfNode.meta) {
+        const meta = this.selfNode.meta;
+        const res = { kind: 'operator_self', operator: meta.operator, target: meta.target, count: this._countVal(), opCount: this._opCountVal(), register: this.register, keys: [...this.buffer] };
+        this.reset();
+        return res;
+      }
+
       if (!this.haveOperator) {
         if (!awaitingMotionChar) {
-          const nextOp = this.operatorNode.children.get(token);
+          const nextOp = this.operatorNode && this.operatorNode.children.get(token);
           if (nextOp) {
             this.operatorNode = nextOp; progressed = true;
             if (nextOp.meta && nextOp.meta.type === 'operator') {
               this.haveOperator = true; this.operatorMeta = nextOp.meta;
               this.motionNode = this.motionsRoot; this.textObjNode = this.textObjectsRoot;
-              const selfStep = this._stepSelfTrie(token, true);
-              progressed = progressed || selfStep.progressed;
+              this.mappingStarted = false;
+              // The final operator key belongs to the operator, not its motion.
+              return { kind: 'prefix', keys: [...this.buffer], operator: this._opInfo(), count: this._countVal() };
             }
           } else {
-            this.operatorNode = this.operatorsRoot;
+            this.operatorNode = null;
           }
-        }
-      } else {
-        if (!awaitingMotionChar) {
-          const selfStep = this._stepSelfTrie(token, false);
-          progressed = progressed || selfStep.progressed;
         }
       }
 
@@ -251,12 +278,6 @@
       if (!this.haveOperator && !this.textObjectStarted() && this.commandNode && this.commandNode.meta && this.commandNode.meta.type === 'command') {
         const meta = this.commandNode.meta;
         const res = { kind: 'command', command: { id: meta.id, args: { ...this.args }, modes: meta.modes }, count: this._countVal(), countProvided: !!this.countStr, register: this.register, keys: [...this.buffer] };
-        this.reset();
-        return res;
-      }
-
-      if (this.selfNode && this.selfNode.meta && this.haveOperator) {
-        const res = { kind: 'operator_self', operator: this.operatorMeta.id, target: this.selfNode.meta.target, count: this._countVal(), opCount: this._opCountVal(), register: this.register, keys: [...this.buffer] };
         this.reset();
         return res;
       }
@@ -292,9 +313,9 @@
       return { kind: 'prefix', keys: [...this.buffer], operator: this._opInfo(), count: this._countVal(), opCount: this._opCountVal() };
     }
 
-    _stepSelfTrie(token, includeStart) {
-      const base = includeStart ? this.operatorSelfRoot : (this.selfNode || this.operatorSelfRoot);
-      const next = base.children.get(token);
+    _stepSelfTrie(token) {
+      const next = this.selfNode && this.selfNode.children.get(token);
+      this.selfNode = next || null;
       if (next) { this.selfNode = next; return { progressed: true }; }
       return { progressed: false };
     }
@@ -309,7 +330,7 @@
       if (this.awaitingCharFor === 'motion' && this.motionNode && this.motionNode.children.has(PLACEHOLDER_CHAR)) {
         if (isSingleCharToken(token)) {
           this.motionNode = this.motionNode.children.get(PLACEHOLDER_CHAR);
-          this.args.char = token;
+          this.args.char = literalChar(token);
           this.awaitingCharFor = null;
           return { progressed: true, awaitedChar: false };
         }
@@ -318,14 +339,9 @@
 
       let next = tryStep(this.motionNode, token);
       if (!next && this.motionNode && this.motionNode.children.has(PLACEHOLDER_CHAR) && isSingleCharToken(token)) {
-        next = this.motionNode.children.get(PLACEHOLDER_CHAR); this.args.char = token;
+        next = this.motionNode.children.get(PLACEHOLDER_CHAR); this.args.char = literalChar(token);
       }
-      if (!next) {
-        next = this.motionsRoot.children.get(token);
-        if (!next && this.motionsRoot.children.has(PLACEHOLDER_CHAR) && isSingleCharToken(token)) {
-          next = this.motionsRoot.children.get(PLACEHOLDER_CHAR); this.args.char = token;
-        }
-      }
+      if (!next) this.motionNode = null;
       if (next) { this.motionNode = next; progressed = true; }
       if (this.motionNode && !this.motionNode.meta && this.motionNode.children.has(PLACEHOLDER_CHAR)) {
         this.awaitingCharFor = 'motion'; awaitedChar = true;
@@ -337,7 +353,7 @@
       let progressed = false;
       const tryStep = (node, t) => node ? node.children.get(t) : null;
       let next = tryStep(this.textObjNode, token);
-      if (!next) next = this.textObjectsRoot.children.get(token);
+      if (!next) this.textObjNode = null;
       if (next) { this.textObjNode = next; progressed = true; }
       return { progressed };
     }
@@ -348,8 +364,9 @@
 
       if (this.awaitingCharFor === 'command' && this.commandNode && this.commandNode.children.has(PLACEHOLDER_CHAR)) {
         if (isSingleCharToken(token)) {
-          this.commandNode = this.commandNode.children.get(PLACEHOLDER_CHAR);
-          this.args.char = token;
+          const exact = this.commandNode.children.get(token);
+          this.commandNode = exact || this.commandNode.children.get(PLACEHOLDER_CHAR);
+          if (!exact) this.args.char = literalChar(token);
           this.awaitingCharFor = null;
           return { progressed: true, awaitedChar: false };
         }
@@ -358,15 +375,9 @@
 
       let next = tryStep(this.commandNode, token);
       if (!next && this.commandNode && this.commandNode.children.has(PLACEHOLDER_CHAR) && isSingleCharToken(token)) {
-        next = this.commandNode.children.get(PLACEHOLDER_CHAR); this.args.char = token;
+        next = this.commandNode.children.get(PLACEHOLDER_CHAR); this.args.char = literalChar(token);
       }
-      if (!next) {
-        const commandRoot = this._getCommandRoot();
-        next = commandRoot.children.get(token);
-        if (!next && commandRoot.children.has(PLACEHOLDER_CHAR) && isSingleCharToken(token)) {
-          next = commandRoot.children.get(PLACEHOLDER_CHAR); this.args.char = token;
-        }
-      }
+      if (!next) this.commandNode = null;
       if (next) { this.commandNode = next; progressed = true; }
       if (this.commandNode && !this.commandNode.meta && this.commandNode.children.has(PLACEHOLDER_CHAR)) {
         this.awaitingCharFor = 'command'; awaitedChar = true;

@@ -20,7 +20,7 @@
         input.style.border = 'none';
         input.style.outline = 'none';
         input.style.width = Math.max(24, (String(tok||'').length + 1) * 8) + 'px';
-        input.addEventListener('input', () => { arrRef[i] = input.value.trim(); onChange(); });
+        input.addEventListener('input', () => { arrRef[i] = window.VimConfig.normalizeToken(input.value === ' ' ? ' ' : input.value.trim()); onChange(); });
         chip.appendChild(input);
         const rem = document.createElement('button'); rem.textContent = '×'; rem.title = 'Remove token'; rem.style.marginLeft = '4px'; rem.style.border = 'none'; rem.style.background='transparent'; rem.style.cursor='pointer'; rem.style.fontSize='14px';
         rem.addEventListener('click', () => { arrRef.splice(i,1); onChange(); render(); });
@@ -157,27 +157,18 @@ document.addEventListener('DOMContentLoaded', async function () {
   function strToTokens(s) { return (s || '').trim() ? (s.trim().split(/\s+/)) : []; }
   function listToStr(a) { return Array.isArray(a) ? a.join(', ') : ''; }
   function strToList(s) { return (s || '').trim() ? s.split(',').map(x => x.trim()).filter(Boolean) : []; }
-  function tokensEqual(a, b) {
-    if (!Array.isArray(a) || !Array.isArray(b)) return false;
-    if (a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) {
-      if (String(a[i] || '').trim() !== String(b[i] || '').trim()) return false;
-    }
-    return true;
+  function validateEdit(section, item, changes) {
+    const candidate = deepClone(currentConfig);
+    const index = currentConfig[section].indexOf(item);
+    candidate[section][index] = { ...candidate[section][index], ...changes };
+    return window.VimConfig.validate(candidate);
   }
-  function specialTokenValid(tok) {
-    return /^<[A-Za-z][A-Za-z0-9-]*>$/.test(tok);
-  }
-  function hasDuplicateTokens(section, candidateTokens, selfItem, typeValue) {
-    const list = Array.isArray(currentConfig[section]) ? currentConfig[section] : [];
-    return list.some(it => {
-      if (it === selfItem) return false;
-      if (!Array.isArray(it.keys)) return false;
-      if (typeof typeValue !== 'undefined') {
-        if ((it && typeof it === 'object' && 'type' in it ? it.type : undefined) !== typeValue) return false;
-      }
-      return tokensEqual(it.keys, candidateTokens);
-    });
+
+  function showValidation(status, button, error) {
+    status.className = error ? 'status err' : 'status ok';
+    status.textContent = error ? 'Invalid: ' + error : 'Valid';
+    button.disabled = !!error;
+    return !error;
   }
 
   function onConfigChange() {
@@ -209,31 +200,14 @@ document.addEventListener('DOMContentLoaded', async function () {
     const box = document.createElement('div');
     box.appendChild(buildModalHeader(title || 'Edit Keys'));
     const v = document.createElement('div'); v.id = 'modal-status'; v.className = 'status'; box.appendChild(v);
-    const validateTokens = (tokens) => {
-      if (!Array.isArray(tokens)) return 'Tokens must be a list';
-      if (tokens.length < 1) return 'Add at least one token';
-      for (let i = 0; i < tokens.length; i++) {
-        const t = (tokens[i] || '').toString().trim();
-        if (!t) return 'Empty token at position ' + (i + 1);
-        if (t.length > 1 && !specialTokenValid(t)) return 'Invalid special token at position ' + (i + 1) + ' (use <...> format)';
-      }
-      return null;
-    };
-    const updateValid = () => {
-      const err = validateTokens(tmp);
-      if (!err) {
-        if (section && hasDuplicateTokens(section, tmp, item, item && item.type)) {
-          v.className = 'status err'; v.textContent = 'Invalid: Duplicate tokens already used in this section';
-        } else { v.className = 'status ok'; v.textContent = 'Valid'; }
-      } else { v.className = 'status err'; v.textContent = 'Invalid: ' + err; }
-    };
+    const updateValid = () => showValidation(v, ok, validateEdit(section, item, { keys: tmp }));
     const tmp = Array.isArray(arrRef) ? arrRef.slice() : [];
     const ed = buildKeysEditor(tmp, () => { updateValid(); });
     box.appendChild(ed);
     const f = document.createElement('div'); f.className = 'footer';
     const help = document.createElement('button'); help.textContent = 'Help'; help.style.background='transparent'; help.style.border='none'; help.style.marginRight='auto'; help.style.color='var(--primary-color)'; help.style.cursor='pointer'; help.addEventListener('click', openHelpModal);
     const ok = document.createElement('button'); ok.textContent = 'Save'; ok.className = 'primary';
-    ok.addEventListener('click', () => { arrRef.splice(0, arrRef.length, ...tmp); saveCb && saveCb(); hideModal(); });
+    ok.addEventListener('click', () => { if (!updateValid()) return; arrRef.splice(0, arrRef.length, ...tmp); saveCb && saveCb(); hideModal(); });
     const cancel = document.createElement('button'); cancel.textContent = 'Cancel'; cancel.addEventListener('click', hideModal);
     f.appendChild(help); f.appendChild(cancel); f.appendChild(ok); box.appendChild(f);
     updateValid();
@@ -260,45 +234,21 @@ document.addEventListener('DOMContentLoaded', async function () {
     const box = document.createElement('div');
     box.appendChild(buildModalHeader('Edit Text Object'));
     const v = document.createElement('div'); v.id = 'modal-status'; v.className = 'status'; box.appendChild(v);
-    const validateTokens = (tokens) => {
-      if (!Array.isArray(tokens)) return 'Tokens must be a list';
-      if (tokens.length < 1) return 'Add at least one token';
-      for (let i = 0; i < tokens.length; i++) {
-        const t = (tokens[i] || '').toString().trim();
-        if (!t) return 'Empty token at position ' + (i + 1);
-        if (t.length > 1 && !specialTokenValid(t)) return 'Invalid special token at position ' + (i + 1) + ' (use <...> format)';
-      }
-      return null;
-    };
-    const validateDelims = (d) => {
-      if (!Array.isArray(d) || d.length < 2) return null;
-      const L = (d[0] || '').toString().trim();
-      const R = (d[1] || '').toString().trim();
-      const hasLeft = L.length > 0;
-      const hasRight = R.length > 0;
-      if (hasLeft && !hasRight) return 'Right delimiter required (or clear both)';
-      if (!hasLeft && hasRight) return 'Left delimiter required (or clear both)';
-      return null;
-    };
-    const updateValid = () => {
-      const e1 = validateTokens(tmpKeys);
-      const e2 = validateDelims(tmpObj.delims);
-      const dup = hasDuplicateTokens('textObjects', tmpKeys, item, item && item.type);
-      const err = e1 || e2 || (dup ? 'Duplicate tokens already used in this section' : null);
-      if (!err) { v.className = 'status ok'; v.textContent = 'Valid'; }
-      else { v.className = 'status err'; v.textContent = 'Invalid: ' + err; }
-    };
+    const updateValid = () => showValidation(v, ok, validateEdit('textObjects', item,
+      { keys: tmpKeys, ...(item.delims ? { delims: tmpObj.delims } : {}) }));
     const keysHeader = document.createElement('div'); keysHeader.textContent = 'Keys'; keysHeader.style.fontWeight = '600'; keysHeader.style.margin = '6px 0';
     box.appendChild(keysHeader);
     const tmpKeys = Array.isArray(item.keys) ? item.keys.slice() : [];
     const ed = buildKeysEditor(tmpKeys, () => { updateValid(); }); box.appendChild(ed);
     const delimsHeader = document.createElement('div'); delimsHeader.textContent = 'Delimiters'; delimsHeader.style.fontWeight = '600'; delimsHeader.style.margin = '12px 0 6px';
-    box.appendChild(delimsHeader);
     const tmpObj = { delims: Array.isArray(item.delims) ? item.delims.slice() : ['', ''] };
-    const delimsEd = buildDelimsEditor(tmpObj, () => { updateValid(); }); box.appendChild(delimsEd);
+    if (item.delims) {
+      box.appendChild(delimsHeader);
+      const delimsEd = buildDelimsEditor(tmpObj, () => { updateValid(); }); box.appendChild(delimsEd);
+    }
     const f = document.createElement('div'); f.className = 'footer';
     const help = document.createElement('button'); help.textContent = 'Help'; help.style.background='transparent'; help.style.border='none'; help.style.marginRight='auto'; help.style.color='var(--primary-color)'; help.style.cursor='pointer'; help.addEventListener('click', openHelpModal);
-    const ok = document.createElement('button'); ok.textContent = 'Save'; ok.className = 'primary'; ok.addEventListener('click', () => { item.keys = tmpKeys; item.delims = Array.isArray(tmpObj.delims) ? tmpObj.delims.slice() : ['', '']; saveCb && saveCb(); hideModal(); });
+    const ok = document.createElement('button'); ok.textContent = 'Save'; ok.className = 'primary'; ok.addEventListener('click', () => { if (!updateValid()) return; item.keys = tmpKeys; if (item.delims) item.delims = tmpObj.delims.slice(); saveCb && saveCb(); hideModal(); });
     const cancel = document.createElement('button'); cancel.textContent = 'Cancel'; cancel.addEventListener('click', hideModal);
     f.appendChild(help); f.appendChild(cancel); f.appendChild(ok); box.appendChild(f);
     updateValid();
@@ -309,24 +259,8 @@ document.addEventListener('DOMContentLoaded', async function () {
     const box = document.createElement('div');
     box.appendChild(buildModalHeader('Edit Command'));
     const v = document.createElement('div'); v.id = 'modal-status'; v.className = 'status'; box.appendChild(v);
-    const validateTokens = (tokens) => {
-      if (!Array.isArray(tokens)) return 'Tokens must be a list';
-      if (tokens.length < 1) return 'Add at least one token';
-      for (let i = 0; i < tokens.length; i++) {
-        const t = (tokens[i] || '').toString().trim();
-        if (!t) return 'Empty token at position ' + (i + 1);
-        if (t.length > 1 && !specialTokenValid(t)) return 'Invalid special token at position ' + (i + 1) + ' (use <...> format)';
-      }
-      return null;
-    };
-    const updateValid = () => {
-      const e1 = validateTokens(tmpKeys);
-      const e2 = set.size ? null : 'Select at least one mode';
-      const dup = hasDuplicateTokens('commands', tmpKeys, item);
-      const err = e1 || e2 || (dup ? 'Duplicate tokens already used in this section' : null);
-      if (!err) { v.className = 'status ok'; v.textContent = 'Valid'; }
-      else { v.className = 'status err'; v.textContent = 'Invalid: ' + err; }
-    };
+    const updateValid = () => showValidation(v, ok, validateEdit('commands', item,
+      { keys: tmpKeys, modes: Array.from(set) }));
     const keysHeader = document.createElement('div'); keysHeader.textContent = 'Keys'; keysHeader.style.fontWeight = '600'; keysHeader.style.margin = '6px 0'; box.appendChild(keysHeader);
     const tmpKeys = Array.isArray(item.keys) ? item.keys.slice() : [];
     const ed = buildKeysEditor(tmpKeys, () => { updateValid(); }); box.appendChild(ed);
@@ -346,7 +280,7 @@ document.addEventListener('DOMContentLoaded', async function () {
     box.appendChild(modesBox);
     const f = document.createElement('div'); f.className = 'footer';
     const help = document.createElement('button'); help.textContent = 'Help'; help.style.background='transparent'; help.style.border='none'; help.style.marginRight='auto'; help.style.color='var(--primary-color)'; help.style.cursor='pointer'; help.addEventListener('click', openHelpModal);
-    const ok = document.createElement('button'); ok.textContent = 'Save'; ok.className = 'primary'; ok.addEventListener('click', () => { item.keys = tmpKeys; item.modes = Array.from(set); saveCb && saveCb(); hideModal(); });
+    const ok = document.createElement('button'); ok.textContent = 'Save'; ok.className = 'primary'; ok.addEventListener('click', () => { if (!updateValid()) return; item.keys = tmpKeys; item.modes = Array.from(set); saveCb && saveCb(); hideModal(); });
     const cancel = document.createElement('button'); cancel.textContent = 'Cancel'; cancel.addEventListener('click', hideModal);
     f.appendChild(help); f.appendChild(cancel); f.appendChild(ok); box.appendChild(f);
     updateValid();
@@ -452,12 +386,18 @@ document.addEventListener('DOMContentLoaded', async function () {
       <div class="row"><small>
         Keys are tokenized sequences. Examples:<br>
         - Single keys: h j k l x %<br>
-        - Special tokens: &lt;ESC&gt;, &lt;C-W&gt;, &lt;C-R&gt;, &lt;char&gt;<br>
+        - Named keys: &lt;ESC&gt;, &lt;Left&gt;, &lt;SPACE&gt;, &lt;S-TAB&gt;<br>
+        - Modifiers: C (Control), A (Alt), M (Meta), S (Shift), in that order; for example &lt;C-S-X&gt;.<br>
+        - Character argument: &lt;char&gt; must remain at the end of commands that require one.<br>
         - Multi-part: g g, g ~, [ ] etc.<br>
         Click "Edit" in a row to modify its tokens. For Text Objects, the editor also allows setting delimiters.
       </small></div>
       <div class="row"><small>
         Non-editable fields (ID, Operator, Target Type) are fixed to preserve behavior.
+        Insert mappings restore ordinary typing on mismatch or timeout (500 ms by default).
+        Advanced JSON settings control mappingTimeoutMs, registerPrefix, allowCountPrefix,
+        allowRegisterPrefix, tokenAliases, and cancelTokens. Remove the default Ctrl+[ alias
+        from tokenAliases to bind it independently. Browser/OS-reserved shortcuts may not reach Docs.
       </small></div>
     `;
     box.appendChild(content);
@@ -479,12 +419,8 @@ document.addEventListener('DOMContentLoaded', async function () {
   function validateJson(text) {
     try {
       const obj = JSON.parse(text);
-      if (!obj || typeof obj !== 'object') throw new Error('Top-level must be an object');
-      const lists = ['motions','operators','textObjects','operatorSelf','commands'];
-      lists.forEach(k => { if (!Array.isArray(obj[k])) obj[k] = []; });
-      if (!obj.settings || typeof obj.settings !== 'object') obj.settings = {};
-      for (const m of obj.motions) { if (!m.id || !Array.isArray(m.keys)) throw new Error('Each motion needs id and keys'); }
-      for (const c of obj.commands) { if (!c.id || !Array.isArray(c.keys)) throw new Error('Each command needs id and keys'); }
+      const error = window.VimConfig.validate(obj);
+      if (error) throw new Error(error);
       return { ok: true, value: obj };
     } catch (e) {
       return { ok: false, error: e.message || String(e) };
@@ -520,6 +456,8 @@ document.addEventListener('DOMContentLoaded', async function () {
         currentConfig = deepClone(baseConfig);
         jsonArea.value = pretty(currentConfig);
         buildEditor();
+        clearTimeout(t);
+        dirty = false;
         setStatusOk('Reset to default');
       } catch (e) {
         setStatusErr('Failed to reset: ' + (e.message || e));
@@ -530,15 +468,18 @@ document.addEventListener('DOMContentLoaded', async function () {
   });
 
   btnSave.addEventListener('click', async () => {
-    let toSave = currentConfig;
-    if (jsonArea && jsonArea.value && jsonArea.value.trim() && jsonArea.value.trim() !== pretty(currentConfig).trim()) {
-      const res = validateJson(jsonArea.value);
-      if (res.ok) toSave = res.value; else setStatusErr('Raw JSON ignored: ' + res.error);
+    clearTimeout(t);
+    const res = validateJson(jsonArea.value);
+    if (!res.ok) {
+      setStatusErr('Not saved: ' + res.error);
+      return;
     }
+    const toSave = res.value;
     try {
       await window.browserAPI.storageLocal.set({ motionsConfig: toSave });
       setStatusOk('Saved');
       currentConfig = deepClone(toSave);
+      buildEditor();
       jsonArea.value = pretty(currentConfig);
       dirty = false;
     } catch (e) {
@@ -549,6 +490,7 @@ document.addEventListener('DOMContentLoaded', async function () {
   // passive json validation while typing
   let t;
   jsonArea.addEventListener('input', () => {
+    dirty = true;
     clearTimeout(t);
     t = setTimeout(() => {
       const res = validateJson(jsonArea.value);

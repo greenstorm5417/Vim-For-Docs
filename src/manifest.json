@@ -25,6 +25,7 @@
   "content_scripts": [
     {
       "js": [
+        "config.js",
         "parser.js",
         "executor.js",
         "ui.js",

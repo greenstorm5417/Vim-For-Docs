@@ -1,7 +1,12 @@
 {
   "schemaVersion": 3,
   "settings": {
-    "allowRegisterPrefix": true
+    "allowRegisterPrefix": true,
+    "registerPrefix": "\"",
+    "allowCountPrefix": true,
+    "mappingTimeoutMs": 500,
+    "tokenAliases": { "<C-[>": "<ESC>" },
+    "cancelTokens": ["<ESC>", "<C-C>"]
   },
   "operators": [
     { "id": "delete", "keys": ["d"], "appliesTo": ["motion", "textobj"], "supportsCount": true },

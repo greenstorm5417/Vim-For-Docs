@@ -1611,9 +1611,29 @@
     }
 
     async exec(result) {
+      await this.dispatch(result);
+      // Keep the input queue locked until the final edit/caret update settles.
+      await waitForDocsResponse();
+    }
+
+    async dispatch(result) {
       focusEditor();
       if (!result || !result.kind) return;
       switch (result.kind) {
+        case "key": {
+          const e = result.event;
+          if (Array.from(e.key || '').length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
+            this.insertReplacementText(e.key);
+          } else {
+            const target = findEditorElement();
+            if (target) {
+              for (const type of ['keydown', 'keyup']) {
+                target.dispatchEvent(new KeyboardEvent(type, { ...e, which: e.keyCode, bubbles: true, cancelable: true }));
+              }
+            }
+          }
+          return;
+        }
         case "motion":
           return this.execMotion(
             result.motion.id,
@@ -3225,7 +3245,8 @@
           const times = Math.max(1, result.count || 1);
           repeat(times, () => Adapter.right({ shift: true }));
           this.insertReplacementText(ch.repeat(times));
-          setTimeout(() => Adapter.left({}), 20);
+          await sleep(20);
+          Adapter.left({});
           this.setLastChange({
             type: "command",
             id: "replace_char",
@@ -3810,7 +3831,8 @@
           const len = payload.length;
           if (len > 0) nav.moveLeftBy(len, false);
         }
-        setTimeout(() => nav.moveLeftBy(1, false), 20);
+        await sleep(20);
+        nav.moveLeftBy(1, false);
         return;
       }
 

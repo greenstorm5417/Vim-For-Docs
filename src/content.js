@@ -37,64 +37,94 @@
   let ui = null;
   let vimEnabled = true;
 
-  // Fire-and-forget exec: returns a Promise but does not block the next user key.
-  // Each command awaits its OWN Docs interactions internally via waitForDocsResponse,
-  // which provides correct intra-command timing without introducing cross-command
-  // mode-state lag (e.g., user typing fast after entering insert mode).
-  function runExec(result) {
-    let p;
+  let executing = false;
+  let draining = false;
+  const commands = [];
+  const inputs = [];
+  let insertPending = [];
+  let mappingTimer = null;
+
+  function suppress(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
+  }
+
+  // Parse queued keys only after the preceding document operation has finished:
+  // a change operator may enter Insert mode while it is awaiting Docs.
+  function drain() {
+    if (draining || executing) return;
+    draining = true;
     try {
-      p = executor.exec(result);
-    } catch (e) {
-      console.error("[VimExecutor] sync error", e);
-      return;
+      while (!executing) {
+        if (commands.length) {
+          executing = true;
+          const run = commands.shift();
+          Promise.resolve().then(run).catch(err => {
+            console.error("[VimExecutor]", err);
+          }).finally(() => {
+            executing = false;
+            drain();
+          });
+        } else if (inputs.length) {
+          const { event, literal } = inputs.shift();
+          handleKey(event, true, literal);
+        } else break;
+      }
+    } finally {
+      draining = false;
     }
-    if (p && typeof p.catch === "function")
-      p.catch((err) => console.error("[VimExecutor] async error", err));
+  }
+
+  function runExec(result, after) {
+    commands.push(async () => {
+      await executor.exec(result);
+      if (after) after();
+    });
+    drain();
   }
 
   function log(...args) {
     if (debug) console.log("[VimParser]", ...args);
   }
 
-  function mapCtrlKeyName(key) {
-    // Normalize control key tokens like <C-E>
-    const specials = {
-      " ": "SPACE",
-      ArrowUp: "Up",
-      ArrowDown: "Down",
-      ArrowLeft: "Left",
-      ArrowRight: "Right",
-      Escape: "ESC",
-      Enter: "CR",
-      Backspace: "BS",
-      Tab: "TAB",
-    };
-    if (specials[key]) return specials[key];
-    if (key.length === 1) return key.toUpperCase();
-    return key;
+  const eventToToken = window.VimConfig.eventToToken;
+  const printable = e => Array.from(e.key || "").length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey;
+
+  function clearInsertMapping() {
+    clearTimeout(mappingTimer);
+    mappingTimer = null;
+    insertPending = [];
   }
 
-  function eventToToken(e) {
-    // Allow Command (Meta) keys to pass through for system/application shortcuts
-    if (e.metaKey) return null;
+  function flushInsertMapping(nextEvent) {
+    const literal = insertPending.filter(e => !e.ctrlKey && !e.altKey && !e.metaKey)
+      .map(event => ({ event, literal: true }));
+    clearInsertMapping();
+    parser.reset();
+    if (ui) ui.setBufferText("");
+    if (nextEvent) literal.push({ event: nextEvent, literal: false });
+    inputs.unshift(...literal);
+    drain();
+  }
 
-    // Control key combinations. Ctrl+[ is Escape (same code in a terminal).
-    if (e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey) {
-      const name = mapCtrlKeyName(e.key);
-      if (name === "[") return "<ESC>";
-      return `<C-${name}>`;
-    }
-    // For printable keys and single-char motions
-    if (e.key.length === 1) return e.key;
-    // Direct named keys we might care about
-    const named = {
-      Escape: "<ESC>",
-      Enter: "<CR>",
-      Backspace: "<BS>",
-      Tab: "<TAB>",
-    };
-    return named[e.key] || null;
+  function replayKey(event) {
+    runExec({
+      kind: "key",
+      event: {
+        key: event.key, code: event.code, keyCode: event.keyCode,
+        ctrlKey: !!event.ctrlKey, altKey: !!event.altKey,
+        metaKey: !!event.metaKey, shiftKey: !!event.shiftKey,
+      },
+    });
+  }
+
+  function applyConfig(config) {
+    const error = window.VimConfig.validate(config);
+    if (error) throw new Error(error);
+    if (insertPending.length) flushInsertMapping();
+    parser.setConfig(config);
+    parser.reset();
   }
 
   function recordInsertCommand(id) {
@@ -160,140 +190,115 @@
     return document;
   }
 
+  function restoreTempNormal() {
+    if (!tempNormal) return;
+    tempNormal = false;
+    const savedOps = insertOps;
+    setMode("insert");
+    insertOps = savedOps;
+  }
+
+  function handleKey(e, replay = false, literal = false) {
+    const token = eventToToken(e);
+    try {
+      if (literal || !vimEnabled) {
+        if (mode === "insert" && printable(e)) appendOpText(e.key);
+        else if (mode === "insert" && e.key === "Enter" && !replaceMode) appendOpText("\n");
+        else if (mode === "insert" && e.key === "Backspace") appendOpBs();
+        if (replaceMode && printable(e) && vimEnabled) {
+          runExec({ kind: "command", command: { id: "insert_replace_char", args: { char: e.key } }, count: 1 });
+        } else replayKey(e);
+        return;
+      }
+      if (mode === "insert") {
+        if (token && (parser.isPending() || parser.isBinding(token))) {
+          suppress(e);
+          clearTimeout(mappingTimer);
+          const res = parser.feed(token);
+          if (res.kind === "invalid") {
+            flushInsertMapping(e);
+            return;
+          }
+          if (res.kind === "prefix" || res.kind === "await_char") {
+            insertPending.push(e);
+            mappingTimer = setTimeout(() => flushInsertMapping(), parser.settings.mappingTimeoutMs);
+          } else clearInsertMapping();
+          dispatchInsertParse(res);
+          return;
+        }
+        if (insertPending.length) {
+          suppress(e);
+          flushInsertMapping(e);
+          return;
+        }
+        if (printable(e)) appendOpText(e.key);
+        else if (e.key === "Enter" && !replaceMode) appendOpText("\n");
+        else if (e.key === "Backspace") appendOpBs();
+        if (replaceMode && printable(e)) {
+          suppress(e);
+          runExec({ kind: "command", command: { id: "insert_replace_char", args: { char: e.key } }, count: 1 });
+        } else if (replay) replayKey(e);
+        return;
+      }
+
+      // Unmapped navigation keys and application shortcuts retain native behavior.
+      // Pending mappings can consume modified keys, even if those keys cannot start one.
+      const nativeKey = !token || e.ctrlKey || e.altKey || e.metaKey ||
+        (!printable(e) && !["Escape", "Enter", "Backspace", "Tab"].includes(e.key));
+      if (parser.isCancel(token)) parser.reset();
+      if (nativeKey && !parser.isBinding(token) && !parser.canContinue(token) && !parser.isCancel(token)) {
+        parser.reset();
+        if (ui) ui.setBufferText("");
+        if (replay) replayKey(e);
+        restoreTempNormal();
+        return;
+      }
+      suppress(e);
+      const res = parser.feed(token);
+      if (!res || res.kind === "invalid") {
+        if (ui) ui.setBufferText("");
+        restoreTempNormal();
+        return;
+      }
+      if (res.kind === "prefix" || res.kind === "await_char") {
+        if (ui) ui.setBufferText((res.keys || []).join(""));
+        return;
+      }
+      log("complete", res);
+      const returnToInsert = tempNormal;
+      runExec(res, () => {
+        if (returnToInsert) restoreTempNormal();
+      });
+      if (ui) ui.setBufferText("");
+    } catch (err) {
+      console.error("Parser error", err);
+    }
+  }
+
   function attachKeyListener() {
     const doc = findEditorDoc();
-    doc.addEventListener(
-      "keydown",
-      (e) => {
-        if (!vimEnabled) return; // respect global enable toggle
-        // Ignore synthetic events generated by our executor to avoid recursion
-        if (!e.isTrusted) return;
-        const token = eventToToken(e);
-        if (!token) return; // allow non-token keys like arrows to flow
-        try {
-          // Insert mode: intercept only config-bound insert commands (so keys
-          // can be rebound in motions.json). Everything else types as usual.
-          if (mode === "insert") {
-            const pending =
-              parser &&
-              typeof parser.isPending === "function" &&
-              parser.isPending();
-            const bound =
-              parser &&
-              typeof parser.isBinding === "function" &&
-              parser.isBinding(token);
-            if (pending || bound) {
-              e.preventDefault();
-              e.stopPropagation();
-              e.stopImmediatePropagation();
-              let res = parser.feed(token);
-              if (dispatchInsertParse(res)) return;
-              // e.g. ESC while awaiting a register name: parser reset, retry
-              if (
-                parser &&
-                typeof parser.isBinding === "function" &&
-                parser.isBinding(token)
-              ) {
-                res = parser.feed(token);
-                if (dispatchInsertParse(res)) return;
-              }
-              return;
-            }
-            // Track printable characters typed in insert/replace mode for '.' repeat
-            if (
-              e.key &&
-              e.key.length === 1 &&
-              !e.ctrlKey &&
-              !e.metaKey &&
-              !e.altKey
-            ) {
-              appendOpText(e.key);
-            } else if (token === "<CR>" && !replaceMode) {
-              appendOpText("\n");
-            } else if (token === "<BS>") {
-              appendOpBs();
-            }
-            // Replace mode: intercept printable characters and perform overwrite via executor
-            if (
-              replaceMode &&
-              e.key &&
-              e.key.length === 1 &&
-              !e.ctrlKey &&
-              !e.metaKey &&
-              !e.altKey
-            ) {
-              e.preventDefault();
-              e.stopPropagation();
-              e.stopImmediatePropagation();
-              try {
-                runExec({
-                  kind: "command",
-                  command: {
-                    id: "insert_replace_char",
-                    args: { char: e.key },
-                    modes: ["insert"],
-                  },
-                  count: 1,
-                });
-              } catch (_) {}
-              return;
-            }
-            return; // allow typing
-          }
-
-          // Let unbound Ctrl+Key chords (Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+1/2/3,
-          // Ctrl+W, ...) reach the page/browser; only intercept control chords
-          // that Vim binds in the current mode, plus exit keys (ESC/Ctrl+[/Ctrl+C)
-          const ctrlNotNormalized = e.ctrlKey && token && !String(token).startsWith("<C-") && token !== "<ESC>";
-          if (
-            e.ctrlKey &&
-            (ctrlNotNormalized ||
-              (parser &&
-                typeof parser.isBinding === "function" &&
-                !parser.isBinding(token)))
-          ) {
-            try {
-              if (parser && typeof parser.reset === "function") parser.reset();
-            } catch (_) {}
-            return; // pass through: not a Vim binding in this mode
-          }
-
-          // In non-insert modes, suppress all tokenized keys by default
-          e.preventDefault();
-          e.stopPropagation();
-          e.stopImmediatePropagation();
-
-          const res = parser.feed(token);
-          if (!res) return;
-
-          if (res.kind === "invalid") {
-            if (ui) ui.setBufferText("");
-            return;
-          }
-
-          if (res.kind === "prefix" || res.kind === "await_char") {
-            if (ui) ui.setBufferText((res.keys || []).join(""));
-            log("prefix", res);
-            return;
-          }
-
-          // Completed parse -> execute (async, fire-and-forget; intra-command waits handle timing)
-          log("complete", res);
-          runExec(res);
-          if (ui) ui.setBufferText("");
-
-          if (tempNormal) {
-            tempNormal = false;
-            const savedOps = insertOps; // preserve insert ops across tempNormal command
-            setMode("insert");
-            insertOps = savedOps;
-          }
-        } catch (err) {
-          console.error("Parser error", err);
-        }
-      },
-      true,
-    );
+    doc.addEventListener("keydown", e => {
+      if (!vimEnabled || !e.isTrusted || e.isComposing || e.key === "Dead" ||
+          e.key === "Process" || e.getModifierState?.("AltGraph")) return;
+      // Modifier-only events do not change the document and need no buffering.
+      if (!eventToToken(e)) return;
+      // Browser shortcuts cannot be replayed with untrusted events.
+      if ((e.ctrlKey || e.metaKey || e.altKey) && !parser.isBinding(eventToToken(e)) &&
+          !parser.canContinue(eventToToken(e)) && !parser.isCancel(eventToToken(e)) &&
+          !(executing && parser.commandsRootByMode.insert.children.has(eventToToken(e)))) {
+        if (insertPending.length) flushInsertMapping();
+        parser.reset();
+        if (ui) ui.setBufferText("");
+        if (executing) commands.push(async () => restoreTempNormal());
+        else restoreTempNormal();
+        return;
+      }
+      if (executing || inputs.length) {
+        suppress(e);
+        inputs.push({ event: e, literal: false });
+        drain();
+      } else handleKey(e);
+    }, true);
   }
 
   function injectPageScript() {
@@ -397,6 +402,8 @@
               }
               try {
                 const parsed = typeof src === "string" ? JSON.parse(src) : src;
+                const error = window.VimConfig.validate(parsed);
+                if (error) throw new Error(error);
                 const migrated = migrateConfig(parsed, base);
                 resolve(migrated);
               } catch (e) {
@@ -505,6 +512,7 @@
           }
           if (changes && changes.enabled) {
             try {
+              if (insertPending.length) flushInsertMapping();
               vimEnabled = !!changes.enabled.newValue;
               if (ui && ui.ind) ui.ind.style.display = vimEnabled ? "" : "none";
             } catch (_) {}
@@ -517,14 +525,12 @@
             const nv = changes.motionsConfig.newValue;
             if (typeof nv !== "undefined") {
               const newCfg = typeof nv === "string" ? JSON.parse(nv) : nv;
-              parser.setConfig(newCfg);
-              parser.reset();
+              applyConfig(newCfg);
               log("Applied updated motions config from storage");
             } else {
               // removed: fall back to base file
               loadConfig().then((baseCfg) => {
-                parser.setConfig(baseCfg);
-                parser.reset();
+                applyConfig(baseCfg);
                 log("Reverted to base motions config");
               });
             }
@@ -539,8 +545,7 @@
     API.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg && msg.action === "reloadMotionsConfig") {
         loadConfig().then((newCfg) => {
-          parser.setConfig(newCfg);
-          parser.reset();
+          applyConfig(newCfg);
           log("Reloaded config");
           sendResponse({ ok: true });
         });
