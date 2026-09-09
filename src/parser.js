@@ -257,7 +257,7 @@
 
       if (this.motionNode && this.motionNode.meta && this.motionNode.meta.type === 'motion' && this.haveOperator) {
         const meta = this.motionNode.meta;
-        const res = { kind: 'operator_motion', operator: this.operatorMeta.id, motion: { id: meta.id, args: { ...this.args } }, count: this._countVal(), opCount: this._opCountVal(), countProvided: !!this.countStr, register: this.register, keys: [...this.buffer] };
+        const res = { kind: 'operator_motion', operator: this.operatorMeta.id, motion: { id: meta.id, args: { ...this.args } }, count: this._countVal(), opCount: this._opCountVal(), countProvided: !!(this.countStr || this.opCountStr), countSemantic: meta.countSemantic || null, register: this.register, keys: [...this.buffer] };
         this.reset();
         return res;
       }

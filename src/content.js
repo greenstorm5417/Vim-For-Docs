@@ -125,6 +125,10 @@
                 e.stopPropagation();
                 e.stopImmediatePropagation();
                 insertRegisterPending = false;
+                try {
+                  const text = executor.getRegisterText(e.key);
+                  if (text) appendOpText(text);
+                } catch (_) {}
                 runExec({
                   kind: "command",
                   command: {
@@ -134,8 +138,17 @@
                   },
                   count: 1,
                 });
+                return;
               }
-              return;
+              insertRegisterPending = false;
+              if (
+                token !== "<ESC>" &&
+                token !== "<C-C>" &&
+                token !== "<C-[" &&
+                token !== "<C-O>"
+              ) {
+                return;
+              }
             }
             if (token === "<ESC>" || token === "<C-C>" || token === "<C-[>") {
               e.preventDefault();
@@ -175,6 +188,14 @@
               "<C-P>": "insert_autocomplete_prev",
             };
             if (insertCommandIds[token]) {
+              if (token === "<C-H>") appendOpBs();
+              else if (token === "<C-J>" && !replaceMode) appendOpText("\n");
+              else if (token === "<C-W>") {
+                try {
+                  const d = executor.nav.prevStartDelta("word");
+                  for (let i = 0; i < d; i++) appendOpBs();
+                } catch (_) {}
+              }
               e.preventDefault();
               e.stopPropagation();
               e.stopImmediatePropagation();
@@ -232,13 +253,20 @@
           // that Vim binds in the current mode, plus exit keys (ESC/Ctrl+[/Ctrl+C)
           const exitToken =
             token === "<ESC>" || token === "<C-[>" || token === "<C-C>";
+          // Ctrl+Shift chords often tokenize as a plain key (e.g. "W"), which
+          // looks like a Vim binding. Let those reach the browser.
+          const ctrlNotNormalized = e.ctrlKey && token && !String(token).startsWith("<C-");
           if (
             !exitToken &&
             e.ctrlKey &&
-            parser &&
-            typeof parser.isBinding === "function" &&
-            !parser.isBinding(token)
+            (ctrlNotNormalized ||
+              (parser &&
+                typeof parser.isBinding === "function" &&
+                !parser.isBinding(token)))
           ) {
+            try {
+              if (parser && typeof parser.reset === "function") parser.reset();
+            } catch (_) {}
             return; // pass through: not a Vim binding in this mode
           }
 

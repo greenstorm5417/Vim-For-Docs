@@ -1680,7 +1680,8 @@
         operator: entry.operator,
         motion: entry.motion,
         textobj: entry.textobj,
-        register: entry.register
+        register: entry.register,
+        countProvided: entry.countProvided
       };
     }
     async replayLastChange(overrideCount) {
@@ -1690,7 +1691,7 @@
         overrideCount && overrideCount > 0 ? overrideCount : c.count || 1;
       switch (c.type) {
         case 'operator_motion':
-          return this.execOperatorMotion({ operator: c.operator, motion: c.motion, count: useCount, register: c.register });
+          return this.execOperatorMotion({ operator: c.operator, motion: c.motion, count: useCount, countProvided: c.countProvided, register: c.register });
         case 'operator_self':
           return this.execOperatorSelf({ operator: c.operator, count: useCount, register: c.register });
         case 'operator_textobj':
@@ -1833,7 +1834,7 @@
         }
         case 'change_operator_motion': {
           this._lastSelType = 'char';
-          this.selectByMotion(c.motion, c.entryCount || 1);
+          this.selectByMotion(c.motion, c.entryCount || 1, { countProvided: c.countProvided });
           await waitForDocsResponse();
           this.applyOperator('change', reg);
           await waitForDocsResponse();
@@ -2086,14 +2087,26 @@
             this.visualLineUp(count);
             break;
           }
-          repeat(count, () => Adapter.up(S));
+          if (this.settingsAPI.getUseDisplayLines()) {
+            repeat(count, () => Adapter.up(S));
+          } else {
+            Adapter.right(S);
+            repeat(count, () => Adapter.ctrlUp(S));
+            Adapter.left(S);
+          }
           break;
         case "down":
           if (curMode === "visualLine") {
             this.visualLineDown(count);
             break;
           }
-          repeat(count, () => Adapter.down(S));
+          if (this.settingsAPI.getUseDisplayLines()) {
+            repeat(count, () => Adapter.down(S));
+          } else {
+            Adapter.right(S);
+            repeat(count, () => Adapter.ctrlDown(S));
+            Adapter.left(S);
+          }
           break;
         case "display_up":
           if (curMode === "visualLine") {
@@ -2459,7 +2472,12 @@
     async execOperatorMotion(result) {
       const { operator, count = 1, opCount } = result;
       let motion = result.motion;
-      const times = (opCount || 1) * (count || 1);
+      const gotoLine = motion && (motion.id === "first_line" || motion.id === "last_line");
+      const countProvided = !!(result.countProvided || opCount);
+      // G/gg use the count as a line number; other motions multiply operator × motion counts.
+      const times = gotoLine
+        ? (countProvided ? (opCount || count) : 1)
+        : (opCount || 1) * (count || 1);
       this._lastSelType = "char";
       // Vim quirk: 'cw' and 'cW' behave like 'ce' and 'cE' so trailing whitespace
       // is preserved (lets you change a word without losing the space after it).
@@ -2474,12 +2492,13 @@
         // 'c'+motion enters insert mode; track typed text so '.' can replay the full change.
         this.startInsert({
           id: "change_operator_motion", count: times, kind: "change",
-          operator: "change", motion: { id: motion.id, args: motion.args || {} }, register: result.register
+          operator: "change", motion: { id: motion.id, args: motion.args || {} },
+          register: result.register, countProvided
         });
       } else {
-        this.setLastChange({ type: "operator_motion", operator, motion: { id: motion.id, args: motion.args || {} }, count: times, register: result.register });
+        this.setLastChange({ type: "operator_motion", operator, motion: { id: motion.id, args: motion.args || {} }, count: times, countProvided, register: result.register });
       }
-      this.selectByMotion(motion, times, result);
+      this.selectByMotion(motion, times, { ...result, countProvided });
       // Wait for Docs to apply the selection (selectionchange + mutation observers).
       await waitForDocsResponse();
       this.applyOperator(operator, result.register);
@@ -3168,8 +3187,7 @@
               result.command.args &&
               result.command.args.char) ||
             '"';
-          const reg = this.registers[name] || this.registers['"'];
-          const textVal = typeof reg === "string" ? reg : reg?.text || "";
+          const textVal = this.getRegisterText(name);
           if (!textVal) return;
           this.insertReplacementText(textVal);
           return;
@@ -3748,10 +3766,17 @@
       });
     }
 
+    getRegisterText(name) {
+      if (!name) return "";
+      const reg = this.registers[name];
+      if (reg == null) return "";
+      return typeof reg === "string" ? reg : reg.text || "";
+    }
+
     async pasteFromRegister(register, opts={}) {
       const name = (register && typeof register === 'string') ? register : '"';
-      const reg = this.registers[name] || this.registers['"'];
-      const textVal = typeof reg === "string" ? reg : reg?.text || "";
+      const reg = this.registers[name];
+      const textVal = this.getRegisterText(name);
       const kind =
         reg && typeof reg === "object" && reg.type ? reg.type : "char";
       if (!textVal) {
