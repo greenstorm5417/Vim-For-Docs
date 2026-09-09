@@ -33,7 +33,6 @@
     if (last && last.type === "bs") last.count++;
     else insertOps.push({ type: "bs", count: 1 });
   }
-  let insertRegisterPending = false; // <C-R>{register} in Insert mode
   let uiTheme = "vim";
   let ui = null;
   let vimEnabled = true;
@@ -80,9 +79,11 @@
     // Allow Command (Meta) keys to pass through for system/application shortcuts
     if (e.metaKey) return null;
 
-    // Control key combinations
+    // Control key combinations. Ctrl+[ is Escape (same code in a terminal).
     if (e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey) {
-      return `<C-${mapCtrlKeyName(e.key)}>`;
+      const name = mapCtrlKeyName(e.key);
+      if (name === "[") return "<ESC>";
+      return `<C-${name}>`;
     }
     // For printable keys and single-char motions
     if (e.key.length === 1) return e.key;
@@ -94,6 +95,59 @@
       Tab: "<TAB>",
     };
     return named[e.key] || null;
+  }
+
+  function recordInsertCommand(id) {
+    if (id === "insert_delete_char_back") appendOpBs();
+    else if (id === "insert_line_break" && !replaceMode) appendOpText("\n");
+    else if (id === "insert_delete_word") {
+      try {
+        const d = executor.nav.prevStartDelta("word");
+        for (let i = 0; i < d; i++) appendOpBs();
+      } catch (_) {}
+    }
+  }
+
+  // Returns true if the parse result was handled (caller should stop).
+  function dispatchInsertParse(res) {
+    if (!res) return true;
+    if (res.kind === "prefix" || res.kind === "await_char") {
+      if (ui) ui.setBufferText((res.keys || []).join(""));
+      return true;
+    }
+    if (res.kind === "invalid") {
+      if (ui) ui.setBufferText("");
+      return false;
+    }
+    if (res.kind !== "command") return false;
+    if (ui) ui.setBufferText("");
+    const id = res.command && res.command.id;
+    if (id === "insert_temp_normal") {
+      tempNormal = true;
+      setMode("normal");
+      return true;
+    }
+    if (id === "exit_insert" || id === "exit_insert_ctrl_c" || (id && String(id).startsWith("exit_"))) {
+      try {
+        executor.finishInsert(insertOps);
+      } catch (_) {}
+      resetInsertOps();
+      replaceMode = false;
+      runExec(res);
+      return true;
+    }
+    if (id === "insert_register") {
+      const ch = res.command.args && res.command.args.char;
+      try {
+        const text = ch ? executor.getRegisterText(ch) : "";
+        if (text) appendOpText(text);
+      } catch (_) {}
+      runExec(res);
+      return true;
+    }
+    recordInsertCommand(id);
+    runExec(res);
+    return true;
   }
 
   function findEditorDoc() {
@@ -117,93 +171,32 @@
         const token = eventToToken(e);
         if (!token) return; // allow non-token keys like arrows to flow
         try {
-          // Insert mode handling: only intercept exits and temp-normal
+          // Insert mode: intercept only config-bound insert commands (so keys
+          // can be rebound in motions.json). Everything else types as usual.
           if (mode === "insert") {
-            if (insertRegisterPending) {
-              if (e.key && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
-                e.preventDefault();
-                e.stopPropagation();
-                e.stopImmediatePropagation();
-                insertRegisterPending = false;
-                try {
-                  const text = executor.getRegisterText(e.key);
-                  if (text) appendOpText(text);
-                } catch (_) {}
-                runExec({
-                  kind: "command",
-                  command: {
-                    id: "insert_register",
-                    args: { char: e.key },
-                    modes: ["insert"],
-                  },
-                  count: 1,
-                });
-                return;
-              }
-              insertRegisterPending = false;
+            const pending =
+              parser &&
+              typeof parser.isPending === "function" &&
+              parser.isPending();
+            const bound =
+              parser &&
+              typeof parser.isBinding === "function" &&
+              parser.isBinding(token);
+            if (pending || bound) {
+              e.preventDefault();
+              e.stopPropagation();
+              e.stopImmediatePropagation();
+              let res = parser.feed(token);
+              if (dispatchInsertParse(res)) return;
+              // e.g. ESC while awaiting a register name: parser reset, retry
               if (
-                token !== "<ESC>" &&
-                token !== "<C-C>" &&
-                token !== "<C-[" &&
-                token !== "<C-O>"
+                parser &&
+                typeof parser.isBinding === "function" &&
+                parser.isBinding(token)
               ) {
-                return;
+                res = parser.feed(token);
+                if (dispatchInsertParse(res)) return;
               }
-            }
-            if (token === "<ESC>" || token === "<C-C>" || token === "<C-[>") {
-              e.preventDefault();
-              e.stopPropagation();
-              e.stopImmediatePropagation();
-              try {
-                executor.finishInsert(insertOps);
-              } catch (_) {}
-              resetInsertOps();
-              replaceMode = false;
-              setMode("normal");
-              return;
-            }
-            if (token === "<C-O>") {
-              // Temporary normal mode for one command
-              e.preventDefault();
-              e.stopPropagation();
-              e.stopImmediatePropagation();
-              tempNormal = true;
-              setMode("normal");
-              return;
-            }
-            if (token === "<C-R>") {
-              e.preventDefault();
-              e.stopPropagation();
-              e.stopImmediatePropagation();
-              insertRegisterPending = true;
-              return;
-            }
-            const insertCommandIds = {
-              "<C-H>": "insert_delete_char_back",
-              "<C-W>": "insert_delete_word",
-              "<C-J>": "insert_line_break",
-              "<C-T>": "insert_indent",
-              "<C-D>": "insert_dedent",
-              "<C-N>": "insert_autocomplete_next",
-              "<C-P>": "insert_autocomplete_prev",
-            };
-            if (insertCommandIds[token]) {
-              if (token === "<C-H>") appendOpBs();
-              else if (token === "<C-J>" && !replaceMode) appendOpText("\n");
-              else if (token === "<C-W>") {
-                try {
-                  const d = executor.nav.prevStartDelta("word");
-                  for (let i = 0; i < d; i++) appendOpBs();
-                } catch (_) {}
-              }
-              e.preventDefault();
-              e.stopPropagation();
-              e.stopImmediatePropagation();
-              runExec({
-                kind: "command",
-                command: { id: insertCommandIds[token], modes: ["insert"] },
-                count: 1,
-              });
               return;
             }
             // Track printable characters typed in insert/replace mode for '.' repeat
@@ -251,13 +244,8 @@
           // Let unbound Ctrl+Key chords (Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+1/2/3,
           // Ctrl+W, ...) reach the page/browser; only intercept control chords
           // that Vim binds in the current mode, plus exit keys (ESC/Ctrl+[/Ctrl+C)
-          const exitToken =
-            token === "<ESC>" || token === "<C-[>" || token === "<C-C>";
-          // Ctrl+Shift chords often tokenize as a plain key (e.g. "W"), which
-          // looks like a Vim binding. Let those reach the browser.
-          const ctrlNotNormalized = e.ctrlKey && token && !String(token).startsWith("<C-");
+          const ctrlNotNormalized = e.ctrlKey && token && !String(token).startsWith("<C-") && token !== "<ESC>";
           if (
-            !exitToken &&
             e.ctrlKey &&
             (ctrlNotNormalized ||
               (parser &&
@@ -274,16 +262,6 @@
           e.preventDefault();
           e.stopPropagation();
           e.stopImmediatePropagation();
-
-          // ESC (or Ctrl+[ / Ctrl+C) should be exit mode regardless of current mode
-          if (exitToken) {
-            runExec({
-              kind: "command",
-              command: { id: "exit_mode" },
-              count: 1,
-            });
-            return;
-          }
 
           const res = parser.feed(token);
           if (!res) return;

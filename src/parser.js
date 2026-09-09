@@ -72,13 +72,16 @@
 
     setMode(mode) {
       this.runtimeMode = mode || 'normal';
-      // Reset command node to use the correct mode's trie
-      this.commandNode = this._getCommandRoot();
+      this.reset();
     }
 
-    // True if `token` can start a motion, command, operator, or text object
-    // in the current runtime mode. Does not mutate parser state.
+    // True if `token` can start a mapping in the current runtime mode.
+    // Insert mode only consults insert commands so hjkl/i/a still type.
     isBinding(token) {
+      if (this.runtimeMode === 'insert') {
+        const root = this._getCommandRoot();
+        return !!(root && root.children.has(token));
+      }
       const roots = [
         this.motionsRoot,
         this._getCommandRoot(),
@@ -87,6 +90,10 @@
         this.textObjectsRoot
       ];
       return roots.some((r) => r && r.children.has(token));
+    }
+
+    isPending() {
+      return !!(this.awaitingCharFor || this.awaitRegister || this.haveOperator || (this.buffer && this.buffer.length));
     }
 
     _getCommandRoot() {
@@ -116,6 +123,7 @@
     }
 
     _feed(token) {
+      if (this.runtimeMode === 'insert') return this._feedInsert(token);
       const settings = this.settings;
       if (this.awaitRegister) {
         if (isSingleCharToken(token)) {
@@ -149,6 +157,25 @@
       }
 
       return this._stepGeneral(token);
+    }
+
+    _feedInsert(token) {
+      this.buffer.push(token);
+      const steppedCmd = this._stepCommandTrie(token);
+      if (steppedCmd.awaitedChar) {
+        return { kind: 'await_char', keys: [...this.buffer] };
+      }
+      if (this.commandNode && this.commandNode.meta && this.commandNode.meta.type === 'command') {
+        const meta = this.commandNode.meta;
+        const res = { kind: 'command', command: { id: meta.id, args: { ...this.args }, modes: meta.modes || ['insert'] }, count: this._countVal(), countProvided: !!this.countStr, register: this.register, keys: [...this.buffer] };
+        this.reset();
+        return res;
+      }
+      if (!steppedCmd.progressed) {
+        this.reset();
+        return { kind: 'invalid' };
+      }
+      return { kind: 'prefix', keys: [...this.buffer] };
     }
 
     motionStarted() { return this.motionNode !== this.motionsRoot; }
