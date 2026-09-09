@@ -4,6 +4,7 @@
       this.theme = 'vim';
       this.modeText = '';
       this.bufferText = '';
+      this.replaceMode = false;
       this.tempNormal = false;
       this.ind = null;
       this.ensureIndicator();
@@ -17,6 +18,7 @@
     }
     setTheme(t) { this.theme = t || 'vim'; this.applyTheme(); this.render(); }
     setMode(m) { this.modeText = m || ''; this.render(); }
+    setReplaceMode(v) { this.replaceMode = !!v; this.render(); }
     setTempNormal(v) { this.tempNormal = !!v; this.render(); }
     setBufferText(s) { this.bufferText = s || ''; this.render(); }
     applyTheme() {
@@ -34,23 +36,33 @@
     }
     render() {
       if (!this.ind) return;
+      
+      const isReplace = this.replaceMode && this.modeText === 'insert';
+      const isTempNormal = this.modeText === 'normal' && this.tempNormal;
+      const disp = (this.modeText === 'visualLine') ? 'VISUAL LINE' : (isReplace ? 'REPLACE' : (this.modeText || '').toUpperCase());
+
       if (this.theme === 'vim') {
         const mt = this.ind.querySelector('.mode-text');
         const ct = this.ind.querySelector('.command-text');
-        const disp = (this.modeText === 'visualLine') ? 'VISUAL LINE' : (this.modeText || '').toUpperCase();
-        if (mt) mt.textContent = (this.modeText === 'normal' && this.tempNormal) ? '-- (Insert) --' : `-- ${disp} --`;
+        
+        let label = `-- ${disp} --`;
+        if (isTempNormal) {
+           label = this.replaceMode ? '-- (Replace) --' : '-- (Insert) --';
+        }
+        
+        if (mt) mt.textContent = label;
         if (ct) ct.textContent = this.bufferText || '';
       } else {
         this.ind.innerHTML = '';
         const text = document.createElement('div');
-        const disp = (this.modeText === 'visualLine') ? 'VISUAL LINE' : (this.modeText || '').toUpperCase();
         text.textContent = disp;
         this.ind.appendChild(text);
         if (this.theme === 'dark') { this.ind.style.backgroundColor = '#222'; this.ind.style.color = '#ddd'; }
         else if (this.theme === 'light') { this.ind.style.backgroundColor = '#f8f9fa'; this.ind.style.color = '#000'; }
-        else if (this.modeText === 'normal') { this.ind.style.backgroundColor = '#1a73e8'; this.ind.style.color = '#fff'; }
-        else if (this.modeText === 'insert') { this.ind.style.backgroundColor = '#34a853'; this.ind.style.color = '#fff'; }
-        else { this.ind.style.backgroundColor = '#fbbc04'; this.ind.style.color = '#000'; }
+        else if (this.modeText === 'normal') { this.ind.style.backgroundColor = 'rgb(214, 227, 251)'; this.ind.style.color = 'rgb(11, 29, 70)'; }
+        else if (isReplace) { this.ind.style.backgroundColor = 'rgb(250, 210, 207)'; this.ind.style.color = 'rgb(70, 11, 11)'; } // Red 100 equivalent
+        else if (this.modeText === 'insert') { this.ind.style.backgroundColor = 'rgb(206, 234, 214)'; this.ind.style.color = 'rgb(11, 70, 29)'; } // Green 100 equivalent
+        else { this.ind.style.backgroundColor = 'rgb(254, 239, 195)'; this.ind.style.color = 'rgb(66, 50, 10)'; } // Yellow 100 equivalent
       }
     }
     updateCursorStyle() {
